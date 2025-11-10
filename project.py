@@ -4020,6 +4020,487 @@ def test_sse():
 # GENDER-ALIGNED STORY SELECTION API
 # ============================================================================
 
+# ============================================================================
+# USER LIBRARY AND BOOK MANAGEMENT
+# ============================================================================
+
+@app.route('/api/user_books')
+@login_required
+def api_user_books():
+    """
+    Protected API endpoint that returns all books for the currently logged-in user.
+    Results are sorted by created_at (most recent first).
+    
+    Returns:
+        JSON response with list of user's books
+    """
+    try:
+        with app.app_context():
+            # Query books for current user, sorted by created_at (most recent first)
+            books = Book.query.filter_by(user_id=current_user.user_id)\
+                             .order_by(Book.created_at.desc())\
+                             .all()
+            
+            # Convert to list of dictionaries
+            books_list = []
+            for book in books:
+                # Get story name from Storyline if available
+                story_name = book.story_id  # Default to story_id
+                if book.story_id:
+                    storyline = Storyline.query.filter_by(story_id=book.story_id).first()
+                    if storyline:
+                        story_name = storyline.name
+                
+                books_list.append({
+                    'book_id': book.book_id,
+                    'story_id': book.story_id,
+                    'story_name': story_name,
+                    'child_name': book.child_name,
+                    'created_at': book.created_at.isoformat() if book.created_at else None,
+                    'pdf_path': book.pdf_path
+                })
+            
+            return jsonify({
+                'success': True,
+                'books': books_list,
+                'count': len(books_list)
+            })
+    
+    except Exception as e:
+        app_logger.error(f"Error fetching user books: {str(e)}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': f'Error fetching books: {str(e)}'
+        }), 500
+
+@app.route('/download_book/<book_id>')
+@login_required
+def download_book(book_id):
+    """
+    Protected route to download a book PDF.
+    Verifies the book belongs to the current user before allowing download.
+    
+    Args:
+        book_id: Unique identifier for the book
+    
+    Returns:
+        File download response or error
+    """
+    try:
+        with app.app_context():
+            # Query book and verify it belongs to current user
+            book = Book.query.filter_by(book_id=book_id, user_id=current_user.user_id).first()
+            
+            if not book:
+                return jsonify({
+                    'success': False,
+                    'error': 'Book not found or access denied'
+                }), 404
+            
+            if not book.pdf_path:
+                return jsonify({
+                    'success': False,
+                    'error': 'PDF file not found for this book'
+                }), 404
+            
+            # Construct full path to PDF file
+            # pdf_path is stored as relative path: {user_id}/{filename}.pdf
+            full_path = os.path.join(BOOK_STORAGE_BASE, book.pdf_path)
+            
+            # Normalize path to handle any path separators
+            full_path = os.path.normpath(full_path)
+            
+            # Verify file exists
+            if not os.path.exists(full_path):
+                app_logger.error(f"PDF file not found at path: {full_path}")
+                return jsonify({
+                    'success': False,
+                    'error': 'PDF file not found on server'
+                }), 404
+            
+            # Generate download filename
+            download_filename = f"{book.child_name or 'storybook'}_{book.story_id or 'book'}.pdf"
+            
+            # Log download
+            app_logger.info(
+                f"User {current_user.user_id} downloading book {book_id}",
+                extra={'user_id': current_user.user_id}
+            )
+            
+            # Send file for download
+            return send_file(
+                full_path,
+                as_attachment=True,
+                download_name=download_filename,
+                mimetype='application/pdf'
+            )
+    
+    except Exception as e:
+        app_logger.error(f"Error downloading book {book_id}: {str(e)}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': f'Error downloading book: {str(e)}'
+        }), 500
+
+@app.route('/library')
+@login_required
+def library():
+    """
+    User-facing dashboard to view and download past books.
+    Shows all books for the logged-in user in a responsive grid layout.
+    """
+    library_html = '''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>My Library - Fairy Tale Generator</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }
+            
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+            }
+            
+            .header {
+                background: white;
+                padding: 30px;
+                border-radius: 20px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                margin-bottom: 30px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 20px;
+            }
+            
+            .header h1 {
+                color: #333;
+                font-size: 2.5em;
+                margin: 0;
+            }
+            
+            .header-actions {
+                display: flex;
+                gap: 15px;
+                align-items: center;
+            }
+            
+            .btn {
+                padding: 12px 24px;
+                border: none;
+                border-radius: 8px;
+                font-size: 1em;
+                cursor: pointer;
+                text-decoration: none;
+                display: inline-block;
+                transition: all 0.3s ease;
+                font-weight: 600;
+            }
+            
+            .btn-primary {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+            }
+            
+            .btn-primary:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+            }
+            
+            .btn-secondary {
+                background: #f8f9fa;
+                color: #333;
+                border: 2px solid #e1e5e9;
+            }
+            
+            .btn-secondary:hover {
+                background: #e9ecef;
+            }
+            
+            .books-container {
+                background: white;
+                padding: 40px;
+                border-radius: 20px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            }
+            
+            .books-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+                gap: 25px;
+                margin-top: 20px;
+            }
+            
+            .book-card {
+                background: #f8f9fa;
+                border: 2px solid #e1e5e9;
+                border-radius: 12px;
+                padding: 20px;
+                transition: all 0.3s ease;
+                display: flex;
+                flex-direction: column;
+            }
+            
+            .book-card:hover {
+                border-color: #667eea;
+                box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
+                transform: translateY(-2px);
+            }
+            
+            .book-thumbnail {
+                width: 100%;
+                height: 200px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                border-radius: 8px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: white;
+                font-size: 3em;
+                margin-bottom: 15px;
+                position: relative;
+                overflow: hidden;
+            }
+            
+            .book-thumbnail::before {
+                content: '📚';
+                font-size: 4em;
+                opacity: 0.3;
+                position: absolute;
+            }
+            
+            .book-info {
+                flex-grow: 1;
+            }
+            
+            .book-title {
+                font-size: 1.3em;
+                font-weight: 600;
+                color: #333;
+                margin-bottom: 8px;
+            }
+            
+            .book-detail {
+                color: #666;
+                font-size: 0.9em;
+                margin-bottom: 5px;
+            }
+            
+            .book-date {
+                color: #999;
+                font-size: 0.85em;
+                margin-top: 10px;
+            }
+            
+            .book-actions {
+                margin-top: 15px;
+                padding-top: 15px;
+                border-top: 1px solid #e1e5e9;
+            }
+            
+            .btn-download {
+                width: 100%;
+                padding: 10px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-size: 0.95em;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                font-weight: 600;
+                text-decoration: none;
+                display: block;
+                text-align: center;
+            }
+            
+            .btn-download:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+            }
+            
+            .empty-state {
+                text-align: center;
+                padding: 60px 20px;
+                color: #666;
+            }
+            
+            .empty-state-icon {
+                font-size: 5em;
+                margin-bottom: 20px;
+                opacity: 0.5;
+            }
+            
+            .empty-state h2 {
+                color: #333;
+                margin-bottom: 10px;
+                font-size: 1.8em;
+            }
+            
+            .empty-state p {
+                color: #666;
+                font-size: 1.1em;
+                margin-bottom: 30px;
+            }
+            
+            .loading {
+                text-align: center;
+                padding: 40px;
+                color: #667eea;
+                font-size: 1.1em;
+            }
+            
+            .loading-spinner {
+                border: 4px solid #f3f3f3;
+                border-top: 4px solid #667eea;
+                border-radius: 50%;
+                width: 40px;
+                height: 40px;
+                animation: spin 1s linear infinite;
+                margin: 0 auto 20px;
+            }
+            
+            @keyframes spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+            
+            @media (max-width: 768px) {
+                .books-grid {
+                    grid-template-columns: 1fr;
+                }
+                
+                .header {
+                    flex-direction: column;
+                    text-align: center;
+                }
+                
+                .header-actions {
+                    width: 100%;
+                    justify-content: center;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>📚 My Library</h1>
+                <div class="header-actions">
+                    <a href="/" class="btn btn-primary">Create New Story</a>
+                    <a href="/logout" class="btn btn-secondary">Logout</a>
+                </div>
+            </div>
+            
+            <div class="books-container">
+                <div id="loading" class="loading">
+                    <div class="loading-spinner"></div>
+                    <p>Loading your books...</p>
+                </div>
+                
+                <div id="booksGrid" class="books-grid" style="display: none;">
+                    <!-- Books will be populated here -->
+                </div>
+                
+                <div id="emptyState" class="empty-state" style="display: none;">
+                    <div class="empty-state-icon">📖</div>
+                    <h2>No Books Yet</h2>
+                    <p>You haven't created any storybooks yet. Start creating your first personalized story!</p>
+                    <a href="/" class="btn btn-primary">Create Your First Story</a>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            // Fetch and display user's books
+            async function loadBooks() {
+                try {
+                    const response = await fetch('/api/user_books');
+                    const data = await response.json();
+                    
+                    const loadingDiv = document.getElementById('loading');
+                    const booksGrid = document.getElementById('booksGrid');
+                    const emptyState = document.getElementById('emptyState');
+                    
+                    loadingDiv.style.display = 'none';
+                    
+                    if (data.success && data.books && data.books.length > 0) {
+                        booksGrid.style.display = 'grid';
+                        emptyState.style.display = 'none';
+                        
+                        // Clear existing content
+                        booksGrid.innerHTML = '';
+                        
+                        // Populate books
+                        data.books.forEach(book => {
+                            const card = document.createElement('div');
+                            card.className = 'book-card';
+                            
+                            // Format date
+                            const date = book.created_at ? new Date(book.created_at).toLocaleDateString('en-US', {
+                                year: 'numeric',
+                                month: 'long',
+                                day: 'numeric'
+                            }) : 'Unknown date';
+                            
+                            card.innerHTML = `
+                                <div class="book-thumbnail">
+                                    <span style="position: relative; z-index: 1;">📖</span>
+                                </div>
+                                <div class="book-info">
+                                    <div class="book-title">${escapeHtml(book.child_name || 'Untitled Story')}</div>
+                                    <div class="book-detail"><strong>Story:</strong> ${escapeHtml(book.story_name || book.story_id || 'Unknown')}</div>
+                                    <div class="book-date">Created: ${date}</div>
+                                </div>
+                                <div class="book-actions">
+                                    <a href="/download_book/${book.book_id}" class="btn-download" download>
+                                        📥 Download PDF
+                                    </a>
+                                </div>
+                            `;
+                            
+                            booksGrid.appendChild(card);
+                        });
+                    } else {
+                        booksGrid.style.display = 'none';
+                        emptyState.style.display = 'block';
+                    }
+                } catch (error) {
+                    console.error('Error loading books:', error);
+                    document.getElementById('loading').innerHTML = 
+                        '<p style="color: #e74c3c;">Error loading books. Please refresh the page.</p>';
+                }
+            }
+            
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+            
+            // Load books on page load
+            loadBooks();
+        </script>
+    </body>
+    </html>
+    '''
+    return render_template_string(library_html)
+
 @app.route('/api/stories_by_gender/<gender>')
 def api_stories_by_gender(gender):
     """

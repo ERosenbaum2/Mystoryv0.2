@@ -23,6 +23,7 @@ import time
 import random
 import queue
 import json
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask_socketio import SocketIO
 # Try to import numpy, but don't fail if it's not available
@@ -56,6 +57,15 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here-change-in-production')
+
+# ============================================================================
+# BOOK STORAGE CONFIGURATION
+# ============================================================================
+
+# Define secure, absolute path for book storage
+# Uses absolute path to ensure security and consistency across environments
+BOOK_STORAGE_BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), 'books'))
+# Structure: /books/{user_id}/{user_id}_{timestamp}_{story_id}.pdf
 
 # Database configuration
 # Use PostgreSQL in production (DATABASE_URL from environment) or SQLite for local development
@@ -238,6 +248,9 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 # Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Ensure book storage base directory exists
+os.makedirs(BOOK_STORAGE_BASE, exist_ok=True)
 
 # Allowed file extensions
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
@@ -910,6 +923,48 @@ def generate_page_image(page_data, user_image_path, output_dir, page_index):
             'error': str(e)
         }
 
+# ============================================================================
+# BOOK STORAGE AND FILE NAMING UTILITIES
+# ============================================================================
+
+def generate_book_filepath(user_id, story_id):
+    """
+    Generate a secure file path for a book PDF following the naming convention:
+    {user_id}_{timestamp}_{story_id}.pdf
+    
+    The file is stored in a user-specific subdirectory: /books/{user_id}/
+    
+    Args:
+        user_id: The user's unique identifier
+        story_id: The story identifier (e.g., 'red', 'jack')
+    
+    Returns:
+        tuple: (full_file_path, relative_file_path)
+            - full_file_path: Absolute path to the file
+            - relative_file_path: Relative path from the base directory (for database storage)
+    """
+    # Create timestamp in format: YYYYMMDD_HHMMSS
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # Generate filename following convention: {user_id}_{timestamp}_{story_id}.pdf
+    filename = f"{user_id}_{timestamp}_{story_id}.pdf"
+    
+    # Create user-specific subdirectory
+    user_dir = os.path.join(BOOK_STORAGE_BASE, str(user_id))
+    os.makedirs(user_dir, exist_ok=True)
+    
+    # Generate full absolute path
+    full_path = os.path.join(user_dir, filename)
+    
+    # Generate relative path for database storage (relative to BOOK_STORAGE_BASE)
+    relative_path = os.path.join(str(user_id), filename)
+    
+    # Normalize paths (handle Windows/Unix differences)
+    full_path = os.path.normpath(full_path)
+    relative_path = os.path.normpath(relative_path).replace('\\', '/')  # Use forward slashes for DB
+    
+    return full_path, relative_path
+
 def _send_sse_event(book_id, event_type, data):
     """
     Helper function to send SSE events to the queue for a specific book_id.
@@ -932,7 +987,7 @@ def _send_sse_event(book_id, event_type, data):
                 # Queue is full, skip this event (non-blocking)
                 pass
 
-def start_book_generation(storyline_id, user_image_path, output_dir=None, book_id=None):
+def start_book_generation(storyline_id, user_image_path, output_dir=None, book_id=None, user_id=None, child_name=None):
     """
     Master function that orchestrates parallel image generation for all 12 story pages.
     
@@ -941,12 +996,15 @@ def start_book_generation(storyline_id, user_image_path, output_dir=None, book_i
     2. Submits all 12 page generation tasks to ThreadPoolExecutor simultaneously
     3. Collects results as they complete using as_completed()
     4. Sends real-time SSE updates when book_id is provided
+    5. Compiles the final PDF and saves it to the database
     
     Args:
         storyline_id: The story_id from the Storyline model (e.g., 'red', 'jack')
         user_image_path: Path to the user's uploaded image
         output_dir: Directory where generated images should be saved (optional)
         book_id: Optional book ID for SSE real-time updates
+        user_id: User ID for book storage and database record (required for saving)
+        child_name: Name of the child featured in the story (required for database record)
     
     Returns:
         dict: {
@@ -956,7 +1014,9 @@ def start_book_generation(storyline_id, user_image_path, output_dir=None, book_i
             'completed_pages': int,
             'failed_pages': int,
             'errors': list of error messages,
-            'output_dir': str
+            'output_dir': str,
+            'pdf_path': str,  # Path to generated PDF (if saved)
+            'book_id': str    # Book ID from database (if saved)
         }
     """
     try:
@@ -1141,6 +1201,62 @@ def start_book_generation(storyline_id, user_image_path, output_dir=None, book_i
                 'page_status': page_status
             })
         
+        # Post-completion: Compile PDF and save to database
+        pdf_path = None
+        saved_book_id = None
+        
+        if failed_count == 0 and user_id and child_name:
+            try:
+                # Generate book filepath using naming convention
+                full_pdf_path, relative_pdf_path = generate_book_filepath(user_id, storyline_id)
+                
+                # Simulate PDF compilation by creating an empty file
+                # In production, this would compile the actual PDF from generated images
+                with open(full_pdf_path, 'wb') as pdf_file:
+                    # Create a minimal PDF header (simulation)
+                    # In production, use reportlab or similar to create actual PDF
+                    pdf_file.write(b'%PDF-1.4\n')
+                    pdf_file.write(b'%Simulated PDF - Replace with actual PDF compilation\n')
+                    pdf_file.write(b'1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n')
+                    pdf_file.write(b'xref\n0 3\ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n100\n%%EOF')
+                
+                print(f"✓ PDF created at: {full_pdf_path}")
+                
+                # Save book record to database
+                with app.app_context():
+                    # Generate book_id if not provided
+                    if not book_id:
+                        saved_book_id = str(uuid.uuid4())
+                    else:
+                        saved_book_id = book_id
+                    
+                    # Create new Book record
+                    new_book = Book(
+                        book_id=saved_book_id,
+                        user_id=user_id,
+                        story_id=storyline_id,
+                        child_name=child_name,
+                        pdf_path=relative_pdf_path  # Store relative path in database
+                    )
+                    
+                    db.session.add(new_book)
+                    db.session.commit()
+                    
+                    print(f"✓ Book record saved to database: {saved_book_id}")
+                    print(f"  - User ID: {user_id}")
+                    print(f"  - Story ID: {storyline_id}")
+                    print(f"  - Child Name: {child_name}")
+                    print(f"  - PDF Path: {relative_pdf_path}")
+                
+                pdf_path = relative_pdf_path
+                
+            except Exception as e:
+                error_msg = f"Error saving book to storage/database: {str(e)}"
+                app_logger.error(error_msg, exc_info=True)
+                print(f"✗ {error_msg}")
+                # Don't fail the entire generation if saving fails
+                errors.append(error_msg)
+        
         return {
             'success': failed_count == 0,
             'results': results,
@@ -1149,7 +1265,9 @@ def start_book_generation(storyline_id, user_image_path, output_dir=None, book_i
             'failed_pages': failed_count,
             'errors': errors,
             'output_dir': output_dir,
-            'page_status': page_status
+            'page_status': page_status,
+            'pdf_path': pdf_path,
+            'book_id': saved_book_id
         }
     
     except Exception as e:

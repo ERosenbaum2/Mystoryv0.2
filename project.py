@@ -1,8 +1,12 @@
 import eventlet
 eventlet.monkey_patch()
-from flask import Flask, request, render_template_string, jsonify, send_from_directory, send_file, session
+from flask import Flask, request, render_template_string, jsonify, send_from_directory, send_file, session, redirect, url_for, flash, Response, stream_with_context
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+from authlib.integrations.flask_client import OAuth
 import os
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
+import re
 from openai import OpenAI
 import base64
 from reportlab.lib.pagesizes import letter
@@ -16,6 +20,10 @@ import tempfile
 import threading
 import uuid
 import time
+import random
+import queue
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask_socketio import SocketIO
 # Try to import numpy, but don't fail if it's not available
 HAS_NUMPY = False
@@ -29,6 +37,19 @@ except (ImportError, ModuleNotFoundError):
     np = None
 
 from typing import List, Dict, Tuple
+import logging
+from logging.handlers import RotatingFileHandler
+from logging import Handler, LogRecord
+
+# Import profanity checker
+try:
+    from better_profanity import profanity
+    # Initialize profanity checker
+    profanity.load_censor_words()
+    PROFANITY_AVAILABLE = True
+except ImportError:
+    PROFANITY_AVAILABLE = False
+    print("Warning: better-profanity not available. Profanity checking will be disabled.")
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
@@ -36,8 +57,178 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here-change-in-production')
 
+# Database configuration
+# Use PostgreSQL in production (DATABASE_URL from environment) or SQLite for local development
+database_url = os.environ.get('DATABASE_URL')
+if database_url:
+    # Production: Use PostgreSQL (DATABASE_URL format: postgresql://user:pass@host:port/dbname)
+    # Render and other platforms provide DATABASE_URL
+    if database_url.startswith('postgres://'):
+        # Convert postgres:// to postgresql:// for SQLAlchemy compatibility
+        database_url = database_url.replace('postgres://', 'postgresql://', 1)
+    app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+else:
+    # Local development: Use SQLite
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///fairy_tale_generator.db'
+
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize database
+from models import db, User, Book, Log, Storyline
+db.init_app(app)
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
+class DBHandler(Handler):
+    """
+    Custom logging handler that writes log records to the database.
+    This handler receives log records and stores them in the logs table.
+    """
+    
+    def __init__(self, app_instance):
+        """
+        Initialize the database handler.
+        
+        Args:
+            app_instance: Flask application instance for database context
+        """
+        super().__init__()
+        self.app = app_instance
+    
+    def emit(self, record: LogRecord):
+        """
+        Emit a log record to the database.
+        
+        Args:
+            record: LogRecord instance containing log information
+        """
+        try:
+            # Extract user_id from record if available (set via extra parameter)
+            user_id = getattr(record, 'user_id', None)
+            
+            # Get log level as string
+            level = record.levelname
+            
+            # Format the log message
+            message = self.format(record)
+            
+            # Create log entry in database
+            with self.app.app_context():
+                log_entry = Log(
+                    user_id=user_id,
+                    level=level,
+                    message=message
+                )
+                db.session.add(log_entry)
+                db.session.commit()
+        except Exception as e:
+            # If database logging fails, don't crash the application
+            # Instead, log to stderr as fallback
+            self.handleError(record)
+            print(f"Error writing log to database: {str(e)}")
+
+def setup_logging(app_instance):
+    """
+    Configure Python's logging module with file and database handlers.
+    
+    Args:
+        app_instance: Flask application instance
+    """
+    # Create logs directory if it doesn't exist
+    logs_dir = 'logs'
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    # Configure root logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicates
+    logger.handlers.clear()
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # File Handler with rotation
+    # Rotates when file reaches 10MB, keeps 5 backup files
+    file_handler = RotatingFileHandler(
+        filename=os.path.join(logs_dir, 'app.log'),
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    # Database Handler
+    db_handler = DBHandler(app_instance)
+    db_handler.setLevel(logging.INFO)
+    db_handler.setFormatter(formatter)
+    logger.addHandler(db_handler)
+    
+    # Also log to console for development
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    logger.info("Logging system initialized - File and Database handlers configured")
+    return logger
+
+# Initialize logging system
+app_logger = setup_logging(app)
+
+# Initialize Flask-Login
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Please log in to access this page.'
+login_manager.login_message_category = 'info'
+
+@login_manager.user_loader
+def load_user(user_id):
+    """Load user from database for Flask-Login session management."""
+    return User.query.get(user_id)
+
+# Initialize OAuth
+oauth = OAuth(app)
+
+# Google OAuth configuration
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
+
+# Register Google OAuth client (only if credentials are provided)
+google = None
+if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+    try:
+        google = oauth.register(
+            name='google',
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+            client_kwargs={
+                'scope': 'openid email profile'
+            }
+        )
+        print("✓ Google OAuth configured successfully")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to configure Google OAuth: {str(e)}")
+        google = None
+else:
+    print("ℹ️  Google OAuth not configured (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET not set)")
+
 # Store progress for each generation task
 generation_progress = {}
+
+# Store SSE event queues for real-time progress updates
+# Key: book_id, Value: queue.Queue for SSE events
+sse_event_queues = {}
+sse_event_queues_lock = threading.Lock()
 
 # Initialize OpenAI client
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
@@ -578,6 +769,401 @@ If the face does NOT match the FIRST illustration, respond with matches: false a
         print(f"Error verifying face match: {str(e)}")
         # If verification fails, assume it matches to avoid blocking generation
         return True, "Verification error - assuming match"
+
+# ============================================================================
+# IMAGE VALIDATION MOCK SERVICE
+# ============================================================================
+
+def validate_image_for_book(file_path):
+    """
+    Mock service for complex image validation.
+    
+    This function simulates validation checks that would normally be performed
+    by a more complex image validation service. It uses random chance (80% pass rate)
+    to simulate real-world validation outcomes.
+    
+    Validation checks performed:
+    1. Face Detection: Verifies exactly 1 face is detected
+    2. Image Quality: Checks if image is blurry or underexposed
+    3. Inappropriate Pose: Detects inappropriate poses (e.g., finger in mouth)
+    4. Content Safety: Validates content safety
+    
+    Args:
+        file_path: Path to the image file to validate
+    
+    Returns:
+        dict: {
+            'status': 'PASS' or 'FAIL',
+            'reason': 'Error message if status is FAIL, empty string if PASS'
+        }
+    """
+    try:
+        # Verify file exists
+        if not os.path.exists(file_path):
+            return {
+                'status': 'FAIL',
+                'reason': 'Image file not found'
+            }
+        
+        # Simulate validation with 80% pass rate
+        # This simulates real-world validation where most images pass
+        pass_rate = 0.80
+        should_pass = random.random() < pass_rate
+        
+        if should_pass:
+            # All checks passed
+            return {
+                'status': 'PASS',
+                'reason': ''
+            }
+        else:
+            # Randomly select which check failed (20% chance of failure)
+            # Each check has equal probability of being the failure reason
+            failure_reasons = [
+                'FAIL: Exactly 1 face not detected.',
+                'FAIL: Image is blurry or underexposed.',
+                'FAIL: Pose is inappropriate (e.g., finger in mouth).',
+                'FAIL: Content safety flag triggered.'
+            ]
+            
+            # Select a random failure reason
+            failure_reason = random.choice(failure_reasons)
+            
+            return {
+                'status': 'FAIL',
+                'reason': failure_reason
+            }
+    
+    except Exception as e:
+        # If validation service encounters an error, fail safely
+        app_logger.error(f"Image validation error for {file_path}: {str(e)}", exc_info=True)
+        return {
+            'status': 'FAIL',
+            'reason': f'Validation service error: {str(e)}'
+        }
+
+# ============================================================================
+# MULTI-THREADED IMAGE GENERATION
+# ============================================================================
+
+def generate_page_image(page_data, user_image_path, output_dir, page_index):
+    """
+    Worker function that simulates the creation of a single page image.
+    
+    This function represents the work that would be done to generate one page
+    of the storybook. In a real implementation, this would call the actual
+    image generation API (e.g., DALL-E).
+    
+    Args:
+        page_data: Dictionary containing page information (scene_desc, text, image_prompt_template)
+        user_image_path: Path to the user's uploaded image
+        output_dir: Directory where generated images should be saved
+        page_index: Index of the page (0-11 for the 12 story pages)
+    
+    Returns:
+        dict: {
+            'page_number': int,  # Page number (1-12)
+            'image_path': str,    # Path to generated image file
+            'success': bool,      # Whether generation succeeded
+            'error': str          # Error message if failed
+        }
+    """
+    try:
+        # Simulate image generation work (in real implementation, this would call DALL-E)
+        # Add random delay to simulate variable generation times (0.5-2 seconds)
+        generation_time = random.uniform(0.5, 2.0)
+        time.sleep(generation_time)
+        
+        # Create a mock image file for demonstration
+        # In production, this would be the actual generated image from DALL-E
+        page_number = page_index + 1
+        image_filename = f'page_{page_number:02d}.png'
+        image_path = os.path.join(output_dir, image_filename)
+        
+        # Create a simple mock image using PIL
+        # This simulates the generated image file
+        mock_image = Image.new('RGB', (1024, 1024), color=(200, 220, 255))
+        
+        # Add some text to indicate it's a mock
+        # Just save a simple colored image as placeholder
+        mock_image.save(image_path, 'PNG')
+        
+        print(f"✓ Generated page {page_number} image: {image_path}")
+        
+        return {
+            'page_number': page_number,
+            'image_path': image_path,
+            'success': True,
+            'error': None
+        }
+    
+    except Exception as e:
+        page_number = page_index + 1
+        error_msg = f"Error generating page {page_number}: {str(e)}"
+        print(f"✗ {error_msg}")
+        app_logger.error(error_msg, exc_info=True)
+        
+        return {
+            'page_number': page_number,
+            'image_path': None,
+            'success': False,
+            'error': str(e)
+        }
+
+def _send_sse_event(book_id, event_type, data):
+    """
+    Helper function to send SSE events to the queue for a specific book_id.
+    
+    Args:
+        book_id: The book ID to send the event to
+        event_type: Type of event (e.g., 'page_complete', 'generation_complete', 'error')
+        data: Dictionary containing event data
+    """
+    with sse_event_queues_lock:
+        if book_id in sse_event_queues:
+            try:
+                event_data = {
+                    'type': event_type,
+                    'data': data,
+                    'timestamp': time.time()
+                }
+                sse_event_queues[book_id].put(event_data, timeout=0.1)
+            except queue.Full:
+                # Queue is full, skip this event (non-blocking)
+                pass
+
+def start_book_generation(storyline_id, user_image_path, output_dir=None, book_id=None):
+    """
+    Master function that orchestrates parallel image generation for all 12 story pages.
+    
+    This function:
+    1. Loads the 12 page objects from the Storyline model
+    2. Submits all 12 page generation tasks to ThreadPoolExecutor simultaneously
+    3. Collects results as they complete using as_completed()
+    4. Sends real-time SSE updates when book_id is provided
+    
+    Args:
+        storyline_id: The story_id from the Storyline model (e.g., 'red', 'jack')
+        user_image_path: Path to the user's uploaded image
+        output_dir: Directory where generated images should be saved (optional)
+        book_id: Optional book ID for SSE real-time updates
+    
+    Returns:
+        dict: {
+            'success': bool,
+            'results': list of result dictionaries from generate_page_image,
+            'total_pages': int,
+            'completed_pages': int,
+            'failed_pages': int,
+            'errors': list of error messages,
+            'output_dir': str
+        }
+    """
+    try:
+        # Create output directory if not provided
+        if output_dir is None:
+            output_dir = os.path.join('generated_images', str(uuid.uuid4()))
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Load storyline from database
+        with app.app_context():
+            storyline = Storyline.query.filter_by(story_id=storyline_id).first()
+            
+            if not storyline:
+                return {
+                    'success': False,
+                    'results': [],
+                    'total_pages': 0,
+                    'completed_pages': 0,
+                    'failed_pages': 0,
+                    'errors': [f'Storyline {storyline_id} not found'],
+                    'output_dir': output_dir
+                }
+            
+            # Get the 12 page objects from the storyline
+            pages = storyline.get_pages()
+            
+            if len(pages) != 12:
+                return {
+                    'success': False,
+                    'results': [],
+                    'total_pages': len(pages),
+                    'completed_pages': 0,
+                    'failed_pages': 0,
+                    'errors': [f'Expected 12 pages but found {len(pages)}'],
+                    'output_dir': output_dir
+                }
+        
+        print(f"\n{'='*60}")
+        print(f"Starting parallel image generation for storyline: {storyline_id}")
+        print(f"Total pages to generate: {len(pages)}")
+        print(f"Output directory: {output_dir}")
+        if book_id:
+            print(f"Book ID for SSE updates: {book_id}")
+        print(f"{'='*60}\n")
+        
+        # Initialize page status tracker for SSE updates
+        page_status = {i+1: {'status': 'pending', 'image_path': None} for i in range(12)}
+        
+        # Send initial status update
+        if book_id:
+            _send_sse_event(book_id, 'generation_started', {
+                'total_pages': 12,
+                'status': 'started'
+            })
+        
+        # Prepare results storage
+        results = []
+        errors = []
+        completed_count = 0
+        failed_count = 0
+        
+        # Use ThreadPoolExecutor to manage parallel execution
+        # max_workers=12 allows all 12 pages to be generated simultaneously
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            # Submit all 12 tasks simultaneously
+            future_to_page = {}
+            
+            for page_index, page_data in enumerate(pages):
+                # Submit each page generation task
+                future = executor.submit(
+                    generate_page_image,
+                    page_data,
+                    user_image_path,
+                    output_dir,
+                    page_index
+                )
+                future_to_page[future] = page_index
+            
+            print(f"✓ Submitted {len(future_to_page)} page generation tasks to ThreadPoolExecutor")
+            
+            # Collect results as they complete (using as_completed for real-time processing)
+            for future in as_completed(future_to_page):
+                page_index = future_to_page[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    
+                    if result['success']:
+                        completed_count += 1
+                        print(f"✓ Page {result['page_number']} completed successfully")
+                        
+                        # Update page status tracker
+                        page_status[result['page_number']] = {
+                            'status': 'complete',
+                            'image_path': result['image_path']
+                        }
+                        
+                        # Send SSE update for completed page
+                        if book_id:
+                            # Convert image path to URL-friendly path
+                            image_url = result['image_path'].replace('\\', '/')
+                            if not image_url.startswith('/'):
+                                image_url = '/' + image_url
+                            
+                            _send_sse_event(book_id, 'page_complete', {
+                                'page_number': result['page_number'],
+                                'image_path': result['image_path'],
+                                'image_url': image_url,
+                                'completed_count': completed_count,
+                                'total_pages': 12
+                            })
+                    else:
+                        failed_count += 1
+                        errors.append(f"Page {result['page_number']}: {result['error']}")
+                        print(f"✗ Page {result['page_number']} failed: {result['error']}")
+                        
+                        # Update page status tracker
+                        page_status[result['page_number']] = {
+                            'status': 'failed',
+                            'image_path': None,
+                            'error': result['error']
+                        }
+                        
+                        # Send SSE update for failed page
+                        if book_id:
+                            _send_sse_event(book_id, 'page_failed', {
+                                'page_number': result['page_number'],
+                                'error': result['error'],
+                                'failed_count': failed_count,
+                                'total_pages': 12
+                            })
+                
+                except Exception as e:
+                    failed_count += 1
+                    error_msg = f"Page {page_index + 1} exception: {str(e)}"
+                    errors.append(error_msg)
+                    print(f"✗ {error_msg}")
+                    
+                    page_number = page_index + 1
+                    results.append({
+                        'page_number': page_number,
+                        'image_path': None,
+                        'success': False,
+                        'error': str(e)
+                    })
+                    
+                    # Update page status tracker
+                    page_status[page_number] = {
+                        'status': 'failed',
+                        'image_path': None,
+                        'error': str(e)
+                    }
+                    
+                    # Send SSE update for exception
+                    if book_id:
+                        _send_sse_event(book_id, 'page_failed', {
+                            'page_number': page_number,
+                            'error': str(e),
+                            'failed_count': failed_count,
+                            'total_pages': 12
+                        })
+        
+        # Sort results by page number for consistent ordering
+        results.sort(key=lambda x: x['page_number'])
+        
+        print(f"\n{'='*60}")
+        print(f"Parallel generation complete!")
+        print(f"Total pages: {len(pages)}")
+        print(f"Completed: {completed_count}")
+        print(f"Failed: {failed_count}")
+        print(f"{'='*60}\n")
+        
+        # Send final completion event
+        if book_id:
+            _send_sse_event(book_id, 'generation_complete', {
+                'success': failed_count == 0,
+                'total_pages': len(pages),
+                'completed_pages': completed_count,
+                'failed_pages': failed_count,
+                'errors': errors,
+                'output_dir': output_dir,
+                'page_status': page_status
+            })
+        
+        return {
+            'success': failed_count == 0,
+            'results': results,
+            'total_pages': len(pages),
+            'completed_pages': completed_count,
+            'failed_pages': failed_count,
+            'errors': errors,
+            'output_dir': output_dir,
+            'page_status': page_status
+        }
+    
+    except Exception as e:
+        error_msg = f"Error in start_book_generation: {str(e)}"
+        app_logger.error(error_msg, exc_info=True)
+        return {
+            'success': False,
+            'results': [],
+            'total_pages': 0,
+            'completed_pages': 0,
+            'failed_pages': 0,
+            'errors': [error_msg],
+            'output_dir': output_dir if 'output_dir' in locals() else None
+        }
 
 def extract_consistency_info_from_image(image_path, page_description, story_choice):
     """
@@ -1746,6 +2332,1482 @@ def create_storybook_pdf(image_paths, text_data_list, output_path, story_title, 
     eventlet.sleep(0)
     print(f"✓ PDF saved successfully")
 
+# ============================================================================
+# AUTHENTICATION UTILITIES
+# ============================================================================
+
+def validate_password(password):
+    """
+    Validate password requirements.
+    
+    Requirements:
+    - Minimum 8 characters
+    - At least 1 number
+    
+    Returns:
+        tuple: (is_valid: bool, error_message: str)
+    """
+    if not password:
+        return False, "Password is required"
+    
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long"
+    
+    if not re.search(r'\d', password):
+        return False, "Password must contain at least one number"
+    
+    return True, ""
+
+def validate_email(email):
+    """
+    Validate email format.
+    
+    Returns:
+        tuple: (is_valid: bool, error_message: str)
+    """
+    if not email:
+        return False, "Email is required"
+    
+    # Basic email validation regex
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, email):
+        return False, "Invalid email format"
+    
+    return True, ""
+
+def validate_child_name(name):
+    """
+    Validate child name according to requirements.
+    
+    Rules:
+    1. Length: Must be 2-20 characters
+    2. Characters: Letters only (no numbers, spaces, or special characters)
+    3. Profanity: Must not contain profane words
+    4. Nonsense: Must not be in the list of nonsense words
+    
+    Args:
+        name: The child's name to validate
+    
+    Returns:
+        tuple: (is_valid: bool, error_message: str)
+    """
+    if not name:
+        return False, "Name is required"
+    
+    # Strip whitespace
+    name = name.strip()
+    
+    # Rule 1: Length check (2-20 characters)
+    if len(name) < 2:
+        return False, "Name must be at least 2 characters long"
+    
+    if len(name) > 20:
+        return False, "Name must be no more than 20 characters long"
+    
+    # Rule 2: Letters only (regex check)
+    # Allow only letters (a-z, A-Z) - no numbers, spaces, or special characters
+    if not re.match(r'^[a-zA-Z]+$', name):
+        return False, "Name must contain only letters (no numbers, spaces, or special characters)"
+    
+    # Rule 3: Profanity check
+    if PROFANITY_AVAILABLE:
+        if profanity.contains_profanity(name):
+            return False, "Name contains inappropriate language"
+    else:
+        # Fallback: Basic profanity check if library not available
+        # This is a simple fallback - the library is preferred
+        common_profanity = ['damn', 'hell', 'crap']  # Very basic fallback
+        if name.lower() in common_profanity:
+            return False, "Name contains inappropriate language"
+    
+    # Rule 4: Nonsense word check
+    # Hardcoded list of common nonsense words to reject
+    nonsense_words = [
+        "Pizza", "Moo", "Keyboard", "Computer", "Mouse", "Screen",
+        "Table", "Chair", "Door", "Window", "Car", "Bus", "Train",
+        "Phone", "Book", "Pen", "Paper", "Desk", "Lamp", "Clock",
+        "Test", "Example", "Sample", "Demo", "Admin", "User",
+        "Password", "Login", "Email", "Website", "Internet"
+    ]
+    
+    # Check if name matches any nonsense word (case-insensitive)
+    if name.capitalize() in [word.capitalize() for word in nonsense_words]:
+        return False, f"'{name}' is not a valid name. Please use a real name."
+    
+    # All checks passed
+    return True, ""
+
+# ============================================================================
+# RATE LIMITING DECORATOR (Skeleton)
+# ============================================================================
+
+def rate_limit(max_requests=5, window_seconds=60):
+    """
+    Rate limiting decorator skeleton.
+    
+    This is a basic structure for rate limiting. In production, you would:
+    1. Use a proper rate limiting library like Flask-Limiter
+    2. Store request counts in Redis or a similar cache
+    3. Implement IP-based or user-based rate limiting
+    4. Add proper error handling and logging
+    
+    Args:
+        max_requests: Maximum number of requests allowed
+        window_seconds: Time window in seconds
+    
+    Usage:
+        @app.route('/some-route')
+        @rate_limit(max_requests=10, window_seconds=60)
+        def some_route():
+            ...
+    """
+    def decorator(f):
+        def wrapper(*args, **kwargs):
+            # TODO: Implement rate limiting logic here
+            # Example structure:
+            # - Get client IP: request.remote_addr
+            # - Check request count for this IP in time window
+            # - If exceeded, return 429 Too Many Requests
+            # - Otherwise, allow request and increment counter
+            
+            # Placeholder: Always allow for now
+            # In production, replace with actual rate limiting logic
+            return f(*args, **kwargs)
+        wrapper.__name__ = f.__name__
+        return wrapper
+    return decorator
+
+# ============================================================================
+# AUTHENTICATION ROUTES
+# ============================================================================
+
+@app.route('/register', methods=['GET', 'POST'])
+@rate_limit(max_requests=5, window_seconds=300)  # 5 registrations per 5 minutes
+def register():
+    """User registration route."""
+    if request.method == 'GET':
+        # Return registration form HTML
+        register_html = '''
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Register - Fairy Tale Generator</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }
+                .container {
+                    background: white;
+                    padding: 40px;
+                    border-radius: 20px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    max-width: 400px;
+                    width: 100%;
+                }
+                h1 { color: #333; margin-bottom: 20px; text-align: center; }
+                .form-group { margin-bottom: 20px; }
+                label { display: block; margin-bottom: 5px; color: #333; font-weight: 600; }
+                input {
+                    width: 100%;
+                    padding: 12px;
+                    border: 2px solid #e1e5e9;
+                    border-radius: 8px;
+                    font-size: 1em;
+                    transition: border-color 0.3s;
+                }
+                input:focus { outline: none; border-color: #667eea; }
+                button {
+                    width: 100%;
+                    padding: 12px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 1.1em;
+                    cursor: pointer;
+                    transition: transform 0.2s;
+                }
+                button:hover { transform: scale(1.02); }
+                .error { color: #e74c3c; margin-top: 10px; font-size: 0.9em; }
+                .success { color: #27ae60; margin-top: 10px; font-size: 0.9em; }
+                .link { text-align: center; margin-top: 20px; }
+                .link a { color: #667eea; text-decoration: none; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Create Account</h1>
+                <form method="POST">
+                    <div class="form-group">
+                        <label for="name">Name</label>
+                        <input type="text" id="name" name="name" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="email">Email</label>
+                        <input type="email" id="email" name="email" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" name="password" required>
+                        <small style="color: #666; font-size: 0.85em;">Min 8 characters, at least 1 number</small>
+                    </div>
+                    <button type="submit">Register</button>
+                    <div class="link">
+                        <a href="/login">Already have an account? Login</a>
+                    </div>
+                </form>
+            </div>
+        </body>
+        </html>
+        '''
+        return render_template_string(register_html)
+    
+    # Handle POST request
+    try:
+        name = request.form.get('name', '').strip()
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+        
+        # Validate inputs
+        email_valid, email_error = validate_email(email)
+        if not email_valid:
+            app_logger.warning(f"Registration attempt failed: Invalid email format (email: {email})")
+            return jsonify({'success': False, 'error': email_error}), 400
+        
+        password_valid, password_error = validate_password(password)
+        if not password_valid:
+            app_logger.warning(f"Registration attempt failed: Invalid password (email: {email}, error: {password_error})")
+            return jsonify({'success': False, 'error': password_error}), 400
+        
+        if not name:
+            app_logger.warning(f"Registration attempt failed: Missing name (email: {email})")
+            return jsonify({'success': False, 'error': 'Name is required'}), 400
+        
+        # Check if user already exists
+        existing_user = User.query.filter_by(email=email).first()
+        if existing_user:
+            app_logger.warning(
+                f"Registration attempt failed: Email already registered (email: {email}, existing_user_id: {existing_user.user_id})",
+                extra={'user_id': existing_user.user_id}
+            )
+            return jsonify({'success': False, 'error': 'Email already registered'}), 400
+        
+        # Create new user
+        user_id = str(uuid.uuid4())
+        password_hash = generate_password_hash(password)
+        
+        new_user = User(
+            user_id=user_id,
+            email=email,
+            name=name,
+            password_hash=password_hash,
+            oauth_provider='email'
+        )
+        
+        db.session.add(new_user)
+        db.session.commit()
+        
+        # Log successful registration
+        app_logger.info(
+            f"User registration successful (user_id: {user_id}, email: {email}, oauth_provider: email)",
+            extra={'user_id': user_id}
+        )
+        
+        # Log the user in automatically after registration
+        login_user(new_user)
+        
+        # Log automatic login after registration
+        app_logger.info(
+            f"User login successful (user_id: {user_id}, email: {email}, oauth_provider: email) - Auto-login after registration",
+            extra={'user_id': user_id}
+        )
+        
+        return jsonify({
+            'success': True,
+            'message': 'Registration successful',
+            'user': new_user.to_dict()
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        app_logger.error(f"Registration error: {str(e)}", exc_info=True)
+        return jsonify({'success': False, 'error': 'Registration failed. Please try again.'}), 500
+
+@app.route('/login', methods=['GET', 'POST'])
+@rate_limit(max_requests=10, window_seconds=300)  # 10 login attempts per 5 minutes
+def login():
+    """User login route."""
+    if request.method == 'GET':
+        # Return login form HTML
+        login_html = '''
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Login - Fairy Tale Generator</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }
+                .container {
+                    background: white;
+                    padding: 40px;
+                    border-radius: 20px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    max-width: 400px;
+                    width: 100%;
+                }
+                h1 { color: #333; margin-bottom: 20px; text-align: center; }
+                .form-group { margin-bottom: 20px; }
+                label { display: block; margin-bottom: 5px; color: #333; font-weight: 600; }
+                input {
+                    width: 100%;
+                    padding: 12px;
+                    border: 2px solid #e1e5e9;
+                    border-radius: 8px;
+                    font-size: 1em;
+                    transition: border-color 0.3s;
+                }
+                input:focus { outline: none; border-color: #667eea; }
+                button {
+                    width: 100%;
+                    padding: 12px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 1.1em;
+                    cursor: pointer;
+                    transition: transform 0.2s;
+                }
+                button:hover { transform: scale(1.02); }
+                .error { color: #e74c3c; margin-top: 10px; font-size: 0.9em; }
+                .link { text-align: center; margin-top: 20px; }
+                .link a { color: #667eea; text-decoration: none; }
+                .divider {
+                    display: flex;
+                    align-items: center;
+                    text-align: center;
+                    margin: 20px 0;
+                    color: #666;
+                }
+                .divider::before,
+                .divider::after {
+                    content: '';
+                    flex: 1;
+                    border-bottom: 1px solid #e1e5e9;
+                }
+                .divider span {
+                    padding: 0 10px;
+                }
+                .google-btn {
+                    width: 100%;
+                    padding: 12px;
+                    background: white;
+                    color: #333;
+                    border: 2px solid #e1e5e9;
+                    border-radius: 8px;
+                    font-size: 1em;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 8px;
+                }
+                .google-btn:hover {
+                    border-color: #4285f4;
+                    background: #f8f9fa;
+                }
+                .google-icon {
+                    width: 20px;
+                    height: 20px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Login</h1>
+                ''' + (f'''
+                <a href="/login/google" style="text-decoration: none;">
+                    <button type="button" class="google-btn">
+                        <svg class="google-icon" viewBox="0 0 24 24">
+                            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                        </svg>
+                        Sign in with Google
+                    </button>
+                </a>
+                <div class="divider">
+                    <span>OR</span>
+                </div>
+                ''' if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET else '') + '''
+                <form method="POST">
+                    <div class="form-group">
+                        <label for="email">Email</label>
+                        <input type="email" id="email" name="email" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" name="password" required>
+                    </div>
+                    <button type="submit">Login</button>
+                    <div class="link">
+                        <a href="/register">Don't have an account? Register</a>
+                    </div>
+                </form>
+            </div>
+        </body>
+        </html>
+        '''
+        return render_template_string(login_html)
+    
+    # Handle POST request
+    try:
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+        
+        if not email or not password:
+            app_logger.warning(f"Login attempt failed: Missing email or password (email: {email})")
+            return jsonify({'success': False, 'error': 'Email and password are required'}), 400
+        
+        # Find user by email
+        user = User.query.filter_by(email=email).first()
+        
+        if not user:
+            # Don't reveal if email exists or not (security best practice)
+            app_logger.warning(f"Login attempt failed: User not found (email: {email})")
+            return jsonify({'success': False, 'error': 'Invalid email or password'}), 401
+        
+        # Check if user has a password (OAuth users might not)
+        if not user.password_hash:
+            app_logger.warning(
+                f"Login attempt failed: User has no password (user_id: {user.user_id}, email: {email}, oauth_provider: {user.oauth_provider})",
+                extra={'user_id': user.user_id}
+            )
+            return jsonify({'success': False, 'error': 'Invalid email or password'}), 401
+        
+        # Verify password
+        if not check_password_hash(user.password_hash, password):
+            app_logger.warning(
+                f"Login attempt failed: Invalid password (user_id: {user.user_id}, email: {email})",
+                extra={'user_id': user.user_id}
+            )
+            return jsonify({'success': False, 'error': 'Invalid email or password'}), 401
+        
+        # Login successful - create session
+        login_user(user)
+        
+        # Log successful login
+        oauth_provider = user.oauth_provider or 'email'
+        app_logger.info(
+            f"User login successful (user_id: {user.user_id}, email: {email}, oauth_provider: {oauth_provider})",
+            extra={'user_id': user.user_id}
+        )
+        
+        return jsonify({
+            'success': True,
+            'message': 'Login successful',
+            'user': user.to_dict()
+        }), 200
+        
+    except Exception as e:
+        app_logger.error(f"Login error: {str(e)}", exc_info=True)
+        return jsonify({'success': False, 'error': 'Login failed. Please try again.'}), 500
+
+@app.route('/logout', methods=['POST', 'GET'])
+@login_required
+def logout():
+    """User logout route."""
+    try:
+        logout_user()
+        return jsonify({'success': True, 'message': 'Logged out successfully'}), 200
+    except Exception as e:
+        print(f"Logout error: {str(e)}")
+        return jsonify({'success': False, 'error': 'Logout failed'}), 500
+
+# ============================================================================
+# OAUTH ROUTES
+# ============================================================================
+
+@app.route('/login/google')
+@rate_limit(max_requests=10, window_seconds=300)  # 10 OAuth attempts per 5 minutes
+def login_google():
+    """
+    Initiate Google OAuth login flow.
+    Redirects user to Google's authorization page.
+    """
+    if not google or not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return jsonify({
+            'success': False,
+            'error': 'Google OAuth is not configured. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables.'
+        }), 500
+    
+    try:
+        # Generate redirect URI for callback
+        redirect_uri = url_for('oauth_google_callback', _external=True)
+        
+        # Redirect to Google OAuth authorization page
+        return google.authorize_redirect(redirect_uri)
+    except Exception as e:
+        print(f"Google OAuth initiation error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Failed to initiate Google OAuth. Please try again.'
+        }), 500
+
+@app.route('/oauth/google/callback')
+def oauth_google_callback():
+    """
+    Handle Google OAuth callback.
+    This route processes the OAuth response and:
+    1. Retrieves user information from Google
+    2. Checks if user exists by email
+    3. If exists, links OAuth ID to existing account
+    4. If not, creates new user account
+    5. Logs the user in
+    """
+    if not google:
+        return jsonify({
+            'success': False,
+            'error': 'Google OAuth is not configured.'
+        }), 500
+    
+    try:
+        # Get authorization token from Google
+        token = google.authorize_access_token()
+        
+        # Fetch user information from Google
+        resp = google.get('https://www.googleapis.com/oauth2/v2/userinfo')
+        resp.raise_for_status()
+        user_info = resp.json()
+        
+        # Extract user information
+        google_id = user_info.get('id')
+        email = user_info.get('email', '').lower()
+        name = user_info.get('name', '')
+        picture = user_info.get('picture', '')
+        
+        if not email:
+            app_logger.warning(f"Google OAuth callback failed: Unable to retrieve email from Google account")
+            return jsonify({
+                'success': False,
+                'error': 'Unable to retrieve email from Google account. Please ensure your Google account has an email address.'
+            }), 400
+        
+        if not google_id:
+            app_logger.warning(f"Google OAuth callback failed: Unable to retrieve user ID from Google (email: {email})")
+            return jsonify({
+                'success': False,
+                'error': 'Unable to retrieve user ID from Google. Please try again.'
+            }), 400
+        
+        # Check if user with this Google OAuth ID already exists
+        existing_user_by_oauth = User.query.filter_by(
+            oauth_provider='google',
+            oauth_id=google_id
+        ).first()
+        
+        if existing_user_by_oauth:
+            # User already exists with this Google account - log them in
+            login_user(existing_user_by_oauth)
+            
+            # Log successful OAuth login
+            app_logger.info(
+                f"User login successful (user_id: {existing_user_by_oauth.user_id}, email: {email}, oauth_provider: google)",
+                extra={'user_id': existing_user_by_oauth.user_id}
+            )
+            
+            return redirect(url_for('index'))
+        
+        # Check if user with this email already exists (account linking)
+        existing_user_by_email = User.query.filter_by(email=email).first()
+        
+        if existing_user_by_email:
+            # User exists with this email - link Google OAuth to existing account
+            existing_user_by_email.oauth_provider = 'google'
+            existing_user_by_email.oauth_id = google_id
+            
+            # Update name if not set or if Google name is available
+            if not existing_user_by_email.name and name:
+                existing_user_by_email.name = name
+            
+            db.session.commit()
+            
+            # Log the user in
+            login_user(existing_user_by_email)
+            
+            # Log successful OAuth login with account linking
+            app_logger.info(
+                f"User login successful (user_id: {existing_user_by_email.user_id}, email: {email}, oauth_provider: google) - Account linked",
+                extra={'user_id': existing_user_by_email.user_id}
+            )
+            
+            return redirect(url_for('index'))
+        
+        # User doesn't exist - create new account
+        user_id = str(uuid.uuid4())
+        
+        new_user = User(
+            user_id=user_id,
+            email=email,
+            name=name if name else email.split('@')[0],  # Use email prefix if no name
+            oauth_provider='google',
+            oauth_id=google_id,
+            password_hash=None  # OAuth users don't have passwords
+        )
+        
+        db.session.add(new_user)
+        db.session.commit()
+        
+        # Log successful registration via OAuth
+        app_logger.info(
+            f"User registration successful (user_id: {user_id}, email: {email}, oauth_provider: google)",
+            extra={'user_id': user_id}
+        )
+        
+        # Log the user in
+        login_user(new_user)
+        
+        # Log successful OAuth login
+        app_logger.info(
+            f"User login successful (user_id: {user_id}, email: {email}, oauth_provider: google) - Auto-login after OAuth registration",
+            extra={'user_id': user_id}
+        )
+        
+        return redirect(url_for('index'))
+        
+    except Exception as e:
+        db.session.rollback()
+        app_logger.error(f"Google OAuth callback error: {str(e)}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': 'OAuth authentication failed. Please try again.'
+        }), 500
+
+# ============================================================================
+# CHILD NAME VALIDATION TEST ROUTE
+# ============================================================================
+
+@app.route('/test_name_validation', methods=['GET', 'POST'])
+def test_name_validation():
+    """
+    Test route to demonstrate child name validation.
+    Accepts GET requests to show the form, and POST requests to test names.
+    """
+    if request.method == 'GET':
+        # Return test form HTML
+        test_html = '''
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Child Name Validation Test</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    padding: 20px;
+                }
+                .container {
+                    max-width: 800px;
+                    margin: 0 auto;
+                    background: white;
+                    padding: 40px;
+                    border-radius: 20px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                }
+                h1 {
+                    color: #333;
+                    margin-bottom: 30px;
+                    text-align: center;
+                }
+                .form-group {
+                    margin-bottom: 20px;
+                }
+                label {
+                    display: block;
+                    margin-bottom: 8px;
+                    color: #333;
+                    font-weight: 600;
+                }
+                input {
+                    width: 100%;
+                    padding: 12px;
+                    border: 2px solid #e1e5e9;
+                    border-radius: 8px;
+                    font-size: 1em;
+                    transition: border-color 0.3s;
+                }
+                input:focus {
+                    outline: none;
+                    border-color: #667eea;
+                }
+                button {
+                    width: 100%;
+                    padding: 12px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 1.1em;
+                    cursor: pointer;
+                    transition: transform 0.2s;
+                    margin-top: 10px;
+                }
+                button:hover {
+                    transform: scale(1.02);
+                }
+                .result {
+                    margin-top: 30px;
+                    padding: 20px;
+                    border-radius: 8px;
+                    font-weight: 600;
+                }
+                .result.success {
+                    background: #d4edda;
+                    color: #155724;
+                    border: 2px solid #c3e6cb;
+                }
+                .result.error {
+                    background: #f8d7da;
+                    color: #721c24;
+                    border: 2px solid #f5c6cb;
+                }
+                .test-cases {
+                    margin-top: 30px;
+                    padding: 20px;
+                    background: #f8f9fa;
+                    border-radius: 8px;
+                }
+                .test-cases h2 {
+                    color: #333;
+                    margin-bottom: 15px;
+                    font-size: 1.3em;
+                }
+                .test-case {
+                    padding: 10px;
+                    margin: 5px 0;
+                    background: white;
+                    border-radius: 5px;
+                    cursor: pointer;
+                    transition: background 0.2s;
+                }
+                .test-case:hover {
+                    background: #e8f0ff;
+                }
+                .back-link {
+                    display: inline-block;
+                    margin-top: 20px;
+                    color: #667eea;
+                    text-decoration: none;
+                }
+                .back-link:hover {
+                    text-decoration: underline;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🧪 Child Name Validation Test</h1>
+                <p style="color: #666; margin-bottom: 20px; text-align: center;">
+                    Test the child name validation function with various inputs
+                </p>
+                
+                <form method="POST">
+                    <div class="form-group">
+                        <label for="name">Enter a name to test:</label>
+                        <input type="text" id="name" name="name" placeholder="e.g., Alice, Pizza, Test123" required>
+                    </div>
+                    <button type="submit">Validate Name</button>
+                </form>
+                
+                ''' + (f'''
+                <div class="result {'success' if request.args.get('valid') == 'true' else 'error' if request.args.get('valid') == 'false' else ''}">
+                    {request.args.get('message', '')}
+                </div>
+                ''' if request.args.get('message') else '') + '''
+                
+                <div class="test-cases">
+                    <h2>Quick Test Cases (Click to test):</h2>
+                    <div class="test-case" onclick="testName('Alice')">✅ Valid: "Alice"</div>
+                    <div class="test-case" onclick="testName('Bob')">✅ Valid: "Bob"</div>
+                    <div class="test-case" onclick="testName('A')">❌ Too Short: "A" (1 character)</div>
+                    <div class="test-case" onclick="testName('ThisNameIsWayTooLongForValidation')">❌ Too Long: "ThisNameIsWayTooLongForValidation"</div>
+                    <div class="test-case" onclick="testName('Test123')">❌ Contains Numbers: "Test123"</div>
+                    <div class="test-case" onclick="testName('John Doe')">❌ Contains Space: "John Doe"</div>
+                    <div class="test-case" onclick="testName('Pizza')">❌ Nonsense Word: "Pizza"</div>
+                    <div class="test-case" onclick="testName('Keyboard')">❌ Nonsense Word: "Keyboard"</div>
+                    <div class="test-case" onclick="testName('Moo')">❌ Nonsense Word: "Moo"</div>
+                </div>
+                
+                <a href="/" class="back-link">← Back to Home</a>
+            </div>
+            
+            <script>
+                function testName(name) {
+                    document.getElementById('name').value = name;
+                    document.querySelector('form').submit();
+                }
+            </script>
+        </body>
+        </html>
+        '''
+        return render_template_string(test_html)
+    
+    # Handle POST request
+    try:
+        name = request.form.get('name', '').strip()
+        
+        if not name:
+            return redirect(url_for('test_name_validation', valid='false', message='No name provided'))
+        
+        # Validate the name
+        is_valid, error_message = validate_child_name(name)
+        
+        if is_valid:
+            message = f'✅ "{name}" is a valid child name!'
+            return redirect(url_for('test_name_validation', valid='true', message=message))
+        else:
+            message = f'❌ "{name}" is invalid: {error_message}'
+            return redirect(url_for('test_name_validation', valid='false', message=message))
+        
+    except Exception as e:
+        app_logger.error(f"Name validation test error: {str(e)}", exc_info=True)
+        return redirect(url_for('test_name_validation', valid='false', message=f'Error: {str(e)}'))
+
+# ============================================================================
+# MULTI-THREADED GENERATION TEST ROUTE
+# ============================================================================
+
+@app.route('/test_parallel_generation', methods=['GET', 'POST'])
+def test_parallel_generation():
+    """
+    Test route to demonstrate parallel image generation.
+    Shows that 12 tasks can be launched and completed concurrently.
+    """
+    if request.method == 'GET':
+        # Return test form HTML
+        test_html = '''
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Parallel Generation Test</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    padding: 20px;
+                }
+                .container {
+                    max-width: 900px;
+                    margin: 0 auto;
+                    background: white;
+                    padding: 40px;
+                    border-radius: 20px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                }
+                h1 { color: #333; margin-bottom: 20px; text-align: center; }
+                .form-group { margin-bottom: 20px; }
+                label { display: block; margin-bottom: 8px; color: #333; font-weight: 600; }
+                select, input {
+                    width: 100%;
+                    padding: 12px;
+                    border: 2px solid #e1e5e9;
+                    border-radius: 8px;
+                    font-size: 1em;
+                }
+                button {
+                    width: 100%;
+                    padding: 12px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 1.1em;
+                    cursor: pointer;
+                    margin-top: 10px;
+                }
+                .result {
+                    margin-top: 30px;
+                    padding: 20px;
+                    border-radius: 8px;
+                    background: #f8f9fa;
+                }
+                .result h2 { color: #333; margin-bottom: 15px; }
+                .result-item {
+                    padding: 10px;
+                    margin: 5px 0;
+                    background: white;
+                    border-radius: 5px;
+                    border-left: 4px solid #667eea;
+                }
+                .result-item.success { border-left-color: #27ae60; }
+                .result-item.error { border-left-color: #e74c3c; }
+                .summary {
+                    margin-top: 20px;
+                    padding: 15px;
+                    background: #e8f0ff;
+                    border-radius: 8px;
+                    font-weight: 600;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🧵 Parallel Image Generation Test</h1>
+                <p style="color: #666; margin-bottom: 20px; text-align: center;">
+                    Test multi-threaded image generation with ThreadPoolExecutor
+                </p>
+                
+                <form method="POST">
+                    <div class="form-group">
+                        <label for="storyline_id">Select Storyline:</label>
+                        <select id="storyline_id" name="storyline_id" required>
+                            <option value="">Choose a storyline...</option>
+                            <option value="red">Little Red Riding Hood (girl)</option>
+                            <option value="jack">Jack and the Beanstalk (boy)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="user_image_path">User Image Path (mock):</label>
+                        <input type="text" id="user_image_path" name="user_image_path" 
+                               placeholder="/path/to/image.jpg" 
+                               value="uploads/mock_image.jpg" required>
+                        <small style="color: #999;">This is a mock path for testing</small>
+                    </div>
+                    <button type="submit">Start Parallel Generation</button>
+                </form>
+                
+                ''' + (f'''
+                <div class="result">
+                    <h2>Generation Results</h2>
+                    <div class="summary">
+                        Total Pages: {request.args.get('total', 'N/A')} | 
+                        Completed: {request.args.get('completed', 'N/A')} | 
+                        Failed: {request.args.get('failed', 'N/A')}
+                    </div>
+                    <pre style="background: #f8f9fa; padding: 15px; border-radius: 5px; overflow-x: auto;">{request.args.get('details', '')}</pre>
+                </div>
+                ''' if request.args.get('total') else '') + '''
+                
+                <a href="/" style="display: inline-block; margin-top: 20px; color: #667eea; text-decoration: none;">← Back to Home</a>
+            </div>
+        </body>
+        </html>
+        '''
+        return render_template_string(test_html)
+    
+    # Handle POST request
+    try:
+        storyline_id = request.form.get('storyline_id', '').strip()
+        user_image_path = request.form.get('user_image_path', '').strip()
+        
+        if not storyline_id:
+            return redirect(url_for('test_parallel_generation', error='Storyline ID is required'))
+        
+        if not user_image_path:
+            return redirect(url_for('test_parallel_generation', error='User image path is required'))
+        
+        # Run parallel generation
+        import json
+        result = start_book_generation(storyline_id, user_image_path)
+        
+        # Format results for display
+        details = []
+        details.append(f"Success: {result['success']}")
+        details.append(f"Total Pages: {result['total_pages']}")
+        details.append(f"Completed: {result['completed_pages']}")
+        details.append(f"Failed: {result['failed_pages']}")
+        details.append(f"\nOutput Directory: {result.get('output_dir', 'N/A')}")
+        details.append(f"\nPage Results:")
+        
+        for page_result in result['results']:
+            status = "✓" if page_result['success'] else "✗"
+            details.append(f"  {status} Page {page_result['page_number']}: {page_result.get('image_path', 'N/A')}")
+            if not page_result['success']:
+                details.append(f"    Error: {page_result.get('error', 'Unknown error')}")
+        
+        if result['errors']:
+            details.append(f"\nErrors:")
+            for error in result['errors']:
+                details.append(f"  - {error}")
+        
+        details_str = "\n".join(details)
+        
+        return redirect(url_for('test_parallel_generation', 
+                              total=result['total_pages'],
+                              completed=result['completed_pages'],
+                              failed=result['failed_pages'],
+                              details=details_str))
+        
+    except Exception as e:
+        app_logger.error(f"Parallel generation test error: {str(e)}", exc_info=True)
+        return redirect(url_for('test_parallel_generation', error=f'Error: {str(e)}'))
+
+# ============================================================================
+# SERVER-SENT EVENTS (SSE) FOR REAL-TIME PROGRESS UPDATES
+# ============================================================================
+
+@app.route('/stream_progress/<book_id>')
+def stream_progress(book_id):
+    """
+    SSE endpoint that streams real-time progress updates for book generation.
+    
+    This endpoint maintains a persistent connection and sends events whenever
+    a page completes generation. Events include:
+    - generation_started: When generation begins
+    - page_complete: When a page finishes (includes page_number and image_url)
+    - page_failed: When a page fails (includes page_number and error)
+    - generation_complete: When all pages are done
+    
+    Args:
+        book_id: Unique identifier for the book generation session
+    
+    Returns:
+        Response: SSE stream with text/event-stream content type
+    """
+    def generate():
+        # Create a queue for this book_id if it doesn't exist
+        with sse_event_queues_lock:
+            if book_id not in sse_event_queues:
+                sse_event_queues[book_id] = queue.Queue(maxsize=100)
+            event_queue = sse_event_queues[book_id]
+        
+        try:
+            # Send initial connection confirmation
+            yield f"data: {json.dumps({'type': 'connected', 'book_id': book_id})}\n\n"
+            
+            # Keep connection alive and listen for events
+            while True:
+                try:
+                    # Wait for event with timeout to allow periodic keep-alive
+                    try:
+                        event = event_queue.get(timeout=30)
+                    except queue.Empty:
+                        # Send keep-alive ping
+                        yield f": keep-alive\n\n"
+                        continue
+                    
+                    # Format event as SSE message
+                    event_json = json.dumps({
+                        'type': event['type'],
+                        'data': event['data'],
+                        'timestamp': event['timestamp']
+                    })
+                    yield f"data: {event_json}\n\n"
+                    
+                    # If generation is complete, close the connection
+                    if event['type'] == 'generation_complete':
+                        break
+                        
+                except GeneratorExit:
+                    # Client disconnected
+                    break
+                except Exception as e:
+                    # Send error event
+                    error_json = json.dumps({
+                        'type': 'error',
+                        'data': {'error': str(e)},
+                        'timestamp': time.time()
+                    })
+                    yield f"data: {error_json}\n\n"
+                    break
+        
+        finally:
+            # Clean up: remove queue when connection closes
+            with sse_event_queues_lock:
+                if book_id in sse_event_queues:
+                    # Drain any remaining events
+                    try:
+                        while True:
+                            sse_event_queues[book_id].get_nowait()
+                    except queue.Empty:
+                        pass
+                    del sse_event_queues[book_id]
+    
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',  # Disable nginx buffering
+            'Connection': 'keep-alive'
+        }
+    )
+
+@app.route('/test_sse', methods=['GET'])
+def test_sse():
+    """
+    Test page demonstrating SSE client-side consumption.
+    Shows how to connect to the SSE endpoint and update UI in real-time.
+    """
+    test_html = '''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SSE Real-Time Progress Test</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }
+            .container {
+                max-width: 1000px;
+                margin: 0 auto;
+                background: white;
+                padding: 40px;
+                border-radius: 20px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            }
+            h1 { color: #333; margin-bottom: 20px; text-align: center; }
+            .status-bar {
+                background: #f8f9fa;
+                padding: 20px;
+                border-radius: 10px;
+                margin-bottom: 20px;
+            }
+            .status-item {
+                display: inline-block;
+                margin-right: 20px;
+                font-weight: 600;
+            }
+            .status-item .label { color: #666; }
+            .status-item .value { color: #667eea; font-size: 1.2em; }
+            .pages-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+                gap: 15px;
+                margin-top: 20px;
+            }
+            .page-card {
+                background: #f8f9fa;
+                border: 3px solid #e1e5e9;
+                border-radius: 10px;
+                padding: 15px;
+                text-align: center;
+                transition: all 0.3s ease;
+            }
+            .page-card.pending {
+                border-color: #e1e5e9;
+                background: #f8f9fa;
+            }
+            .page-card.complete {
+                border-color: #27ae60;
+                background: #d4edda;
+            }
+            .page-card.failed {
+                border-color: #e74c3c;
+                background: #f8d7da;
+            }
+            .page-number {
+                font-size: 1.5em;
+                font-weight: 600;
+                margin-bottom: 10px;
+            }
+            .page-status {
+                font-size: 0.9em;
+                color: #666;
+            }
+            .page-image {
+                max-width: 100%;
+                max-height: 120px;
+                border-radius: 5px;
+                margin-top: 10px;
+                display: none;
+            }
+            .page-card.complete .page-image {
+                display: block;
+            }
+            .controls {
+                margin-top: 30px;
+                text-align: center;
+            }
+            button {
+                padding: 12px 30px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-size: 1.1em;
+                cursor: pointer;
+                margin: 0 10px;
+            }
+            button:hover { transform: scale(1.05); }
+            button:disabled {
+                opacity: 0.6;
+                cursor: not-allowed;
+            }
+            .log {
+                margin-top: 20px;
+                padding: 15px;
+                background: #f8f9fa;
+                border-radius: 8px;
+                max-height: 200px;
+                overflow-y: auto;
+                font-family: monospace;
+                font-size: 0.9em;
+            }
+            .log-entry {
+                padding: 5px 0;
+                border-bottom: 1px solid #e1e5e9;
+            }
+            .log-entry:last-child {
+                border-bottom: none;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📡 Server-Sent Events (SSE) Test</h1>
+            <p style="color: #666; margin-bottom: 20px; text-align: center;">
+                Real-time progress updates for parallel image generation
+            </p>
+            
+            <div class="status-bar">
+                <div class="status-item">
+                    <span class="label">Status:</span>
+                    <span class="value" id="connectionStatus">Disconnected</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">Completed:</span>
+                    <span class="value" id="completedCount">0</span>
+                    <span class="label">/ 12</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">Failed:</span>
+                    <span class="value" id="failedCount">0</span>
+                </div>
+            </div>
+            
+            <div class="pages-grid" id="pagesGrid">
+                <!-- Page cards will be generated here -->
+            </div>
+            
+            <div class="controls">
+                <button id="startBtn" onclick="startGeneration()">Start Generation</button>
+                <button id="connectBtn" onclick="connectSSE()" disabled>Connect to SSE</button>
+                <button id="disconnectBtn" onclick="disconnectSSE()" disabled>Disconnect</button>
+            </div>
+            
+            <div class="log" id="eventLog">
+                <div class="log-entry">Ready. Click "Start Generation" to begin.</div>
+            </div>
+            
+            <a href="/" style="display: inline-block; margin-top: 20px; color: #667eea; text-decoration: none;">← Back to Home</a>
+        </div>
+        
+        <script>
+            let eventSource = null;
+            let currentBookId = null;
+            let pageStatus = {};
+            
+            // Initialize page cards
+            function initPages() {
+                const grid = document.getElementById('pagesGrid');
+                grid.innerHTML = '';
+                for (let i = 1; i <= 12; i++) {
+                    const card = document.createElement('div');
+                    card.className = 'page-card pending';
+                    card.id = `page-${i}`;
+                    card.innerHTML = `
+                        <div class="page-number">Page ${i}</div>
+                        <div class="page-status">Pending</div>
+                        <img class="page-image" src="" alt="Page ${i}">
+                    `;
+                    grid.appendChild(card);
+                    pageStatus[i] = 'pending';
+                }
+            }
+            
+            function addLogEntry(message) {
+                const log = document.getElementById('eventLog');
+                const entry = document.createElement('div');
+                entry.className = 'log-entry';
+                entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+                log.insertBefore(entry, log.firstChild);
+                if (log.children.length > 50) {
+                    log.removeChild(log.lastChild);
+                }
+            }
+            
+            function updatePageStatus(pageNumber, status, imageUrl = null) {
+                const card = document.getElementById(`page-${pageNumber}`);
+                if (!card) return;
+                
+                card.className = `page-card ${status}`;
+                const statusDiv = card.querySelector('.page-status');
+                const image = card.querySelector('.page-image');
+                
+                if (status === 'complete') {
+                    statusDiv.textContent = 'Complete ✓';
+                    if (imageUrl) {
+                        image.src = imageUrl;
+                        image.alt = `Page ${pageNumber}`;
+                    }
+                } else if (status === 'failed') {
+                    statusDiv.textContent = 'Failed ✗';
+                } else {
+                    statusDiv.textContent = 'Pending...';
+                }
+                
+                pageStatus[pageNumber] = status;
+                updateCounts();
+            }
+            
+            function updateCounts() {
+                const completed = Object.values(pageStatus).filter(s => s === 'complete').length;
+                const failed = Object.values(pageStatus).filter(s => s === 'failed').length;
+                
+                document.getElementById('completedCount').textContent = completed;
+                document.getElementById('failedCount').textContent = failed;
+            }
+            
+            function connectSSE(bookId) {
+                if (eventSource) {
+                    disconnectSSE();
+                }
+                
+                if (!bookId) {
+                    bookId = currentBookId || prompt('Enter Book ID:');
+                    if (!bookId) return;
+                }
+                
+                currentBookId = bookId;
+                const url = `/stream_progress/${bookId}`;
+                
+                addLogEntry(`Connecting to SSE endpoint: ${url}`);
+                
+                eventSource = new EventSource(url);
+                
+                eventSource.onopen = function() {
+                    addLogEntry('SSE connection opened');
+                    document.getElementById('connectionStatus').textContent = 'Connected';
+                    document.getElementById('connectBtn').disabled = true;
+                    document.getElementById('disconnectBtn').disabled = false;
+                };
+                
+                eventSource.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        handleSSEEvent(data);
+                    } catch (e) {
+                        addLogEntry(`Error parsing event: ${e.message}`);
+                    }
+                };
+                
+                eventSource.onerror = function(error) {
+                    addLogEntry(`SSE error: ${error}`);
+                    document.getElementById('connectionStatus').textContent = 'Error';
+                };
+            }
+            
+            function handleSSEEvent(event) {
+                const { type, data } = event;
+                
+                switch(type) {
+                    case 'connected':
+                        addLogEntry(`Connected to book_id: ${data.book_id}`);
+                        break;
+                    
+                    case 'generation_started':
+                        addLogEntry(`Generation started: ${data.total_pages} pages`);
+                        initPages();
+                        break;
+                    
+                    case 'page_complete':
+                        addLogEntry(`Page ${data.page_number} completed! (${data.completed_count}/${data.total_pages})`);
+                        updatePageStatus(data.page_number, 'complete', data.image_url);
+                        break;
+                    
+                    case 'page_failed':
+                        addLogEntry(`Page ${data.page_number} failed: ${data.error}`);
+                        updatePageStatus(data.page_number, 'failed');
+                        break;
+                    
+                    case 'generation_complete':
+                        addLogEntry(`Generation complete! Success: ${data.success}, Completed: ${data.completed_pages}, Failed: ${data.failed_pages}`);
+                        document.getElementById('connectionStatus').textContent = 'Complete';
+                        if (eventSource) {
+                            eventSource.close();
+                            eventSource = null;
+                        }
+                        break;
+                    
+                    default:
+                        addLogEntry(`Unknown event type: ${type}`);
+                }
+            }
+            
+            function disconnectSSE() {
+                if (eventSource) {
+                    eventSource.close();
+                    eventSource = null;
+                    addLogEntry('SSE connection closed');
+                    document.getElementById('connectionStatus').textContent = 'Disconnected';
+                    document.getElementById('connectBtn').disabled = false;
+                    document.getElementById('disconnectBtn').disabled = true;
+                }
+            }
+            
+            async function startGeneration() {
+                const bookId = prompt('Enter Book ID (or leave empty to generate one):');
+                if (bookId === null) return;
+                
+                const finalBookId = bookId || `test-${Date.now()}`;
+                currentBookId = finalBookId;
+                
+                addLogEntry(`Starting generation with book_id: ${finalBookId}`);
+                
+                // Connect to SSE first
+                connectSSE(finalBookId);
+                
+                // In a real implementation, you would call an API endpoint to start generation
+                // For this demo, we'll just show how to connect
+                addLogEntry('Note: In production, call /api/start-generation with book_id to trigger generation');
+                
+                document.getElementById('startBtn').disabled = true;
+            }
+            
+            // Initialize on page load
+            initPages();
+        </script>
+    </body>
+    </html>
+    '''
+    return render_template_string(test_html)
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -2364,10 +4426,23 @@ def download_pdf(task_id):
         download_name=f"Storybook.pdf"
     )
 
+def init_db():
+    """
+    Initialize the database by creating all tables.
+    This should be called once to set up the database schema.
+    """
+    with app.app_context():
+        db.create_all()
+        print("✅ Database initialized successfully!")
+
 if __name__ == '__main__':
     import sys
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    
+    # Initialize database tables
+    init_db()
+    
     port = int(os.environ.get('PORT', 5000))
     print("✨ Starting Fairy Tale Generator...")
     print(f"🌐 Web interface: http://localhost:{port}")

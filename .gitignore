@@ -51,6 +51,7 @@ instance/
 
 # Logs
 *.log
+logs/
 
 # Secrets
 secrets.txt

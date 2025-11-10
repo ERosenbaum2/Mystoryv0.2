@@ -1982,11 +1982,12 @@ HTML_TEMPLATE = '''
                 
                 <div class="form-group">
                     <label>Select Story:</label>
-                    <select name="story" id="storySelect" required>
-                        <option value="">Choose a story...</option>
-                        <option value="jack">Jack and the Beanstalk</option>
-                        <option value="red">Little Red Riding Hood</option>
+                    <select name="story" id="storySelect" required disabled>
+                        <option value="">Please select a gender first</option>
                     </select>
+                    <small id="storyHelp" style="color: #999; display: block; margin-top: 5px;">
+                        Select a gender to see available stories
+                    </small>
                 </div>
                 
                 <div class="form-group">
@@ -2037,6 +2038,87 @@ HTML_TEMPLATE = '''
             });
             element.classList.add('selected');
             document.querySelector(`input[name="${name}"][value="${value}"]`).checked = true;
+            
+            // If gender is being selected, trigger story dropdown update
+            if (name === 'gender') {
+                updateStoryDropdown(value);
+            }
+            
+            // Validate form
+            validateForm();
+        }
+        
+        function updateStoryDropdown(gender) {
+            const storySelect = document.getElementById('storySelect');
+            const submitBtn = document.getElementById('submitBtn');
+            const storyHelp = document.getElementById('storyHelp');
+            
+            // Clear current selection
+            storySelect.innerHTML = '<option value="">Loading stories...</option>';
+            storySelect.disabled = true;
+            submitBtn.disabled = true;
+            storyHelp.textContent = 'Loading stories...';
+            
+            // Make AJAX call to fetch stories by gender
+            fetch(`/api/stories_by_gender/${gender}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        // Clear and populate dropdown
+                        storySelect.innerHTML = '<option value="">Choose a story...</option>';
+                        
+                        if (data.stories && data.stories.length > 0) {
+                            data.stories.forEach(story => {
+                                const option = document.createElement('option');
+                                option.value = story.story_id;
+                                option.textContent = story.name;
+                                storySelect.appendChild(option);
+                            });
+                            storySelect.disabled = false;
+                            storyHelp.textContent = `${data.count} story${data.count !== 1 ? 'ies' : ''} available`;
+                        } else {
+                            storySelect.innerHTML = '<option value="">No stories available</option>';
+                            storySelect.disabled = true;
+                            storyHelp.textContent = 'No stories available for this gender';
+                        }
+                    } else {
+                        storySelect.innerHTML = '<option value="">Error loading stories</option>';
+                        storySelect.disabled = true;
+                        storyHelp.textContent = 'Error loading stories';
+                        console.error('Error loading stories:', data.error);
+                    }
+                    
+                    // Re-validate form
+                    validateForm();
+                })
+                .catch(error => {
+                    console.error('Error fetching stories:', error);
+                    storySelect.innerHTML = '<option value="">Error loading stories</option>';
+                    storySelect.disabled = true;
+                    storyHelp.textContent = 'Error loading stories. Please try again.';
+                    validateForm();
+                });
+        }
+        
+        function validateForm() {
+            const gender = document.querySelector('input[name="gender"]:checked');
+            const story = document.getElementById('storySelect');
+            const characterName = document.getElementById('characterName');
+            const imageInput = document.getElementById('imageInput');
+            const submitBtn = document.getElementById('submitBtn');
+            
+            // Check if all required fields are filled
+            const isGenderSelected = gender !== null;
+            const isStorySelected = story.value !== '';
+            const isCharacterNameFilled = characterName.value.trim() !== '';
+            const isImageSelected = imageInput.files.length > 0;
+            
+            // Enable/disable submit button based on validation
+            if (isGenderSelected && isStorySelected && isCharacterNameFilled && isImageSelected) {
+                submitBtn.disabled = false;
+            } else {
+                submitBtn.disabled = true;
+            }
         }
         
         const imageInput = document.getElementById('imageInput');
@@ -2055,7 +2137,15 @@ HTML_TEMPLATE = '''
                 };
                 reader.readAsDataURL(file);
             }
+            validateForm();
         });
+        
+        // Add event listeners for form validation
+        document.getElementById('characterName').addEventListener('input', validateForm);
+        document.getElementById('storySelect').addEventListener('change', validateForm);
+        
+        // Initialize submit button as disabled
+        document.getElementById('submitBtn').disabled = true;
         
         // Drag and drop functionality
         const fileUpload = document.querySelector('.file-upload');
@@ -3925,6 +4015,56 @@ def test_sse():
     </html>
     '''
     return render_template_string(test_html)
+
+# ============================================================================
+# GENDER-ALIGNED STORY SELECTION API
+# ============================================================================
+
+@app.route('/api/stories_by_gender/<gender>')
+def api_stories_by_gender(gender):
+    """
+    API endpoint that returns stories filtered by gender.
+    
+    Args:
+        gender: 'boy' or 'girl'
+    
+    Returns:
+        JSON response with list of stories matching the specified gender
+    """
+    try:
+        # Validate gender parameter
+        if gender not in ['boy', 'girl']:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid gender. Must be "boy" or "girl"'
+            }), 400
+        
+        # Query Storyline model for stories matching the gender
+        with app.app_context():
+            storylines = Storyline.query.filter_by(gender=gender).all()
+            
+            # Convert to list of dictionaries
+            stories = []
+            for storyline in storylines:
+                stories.append({
+                    'story_id': storyline.story_id,
+                    'name': storyline.name,
+                    'gender': storyline.gender
+                })
+            
+            return jsonify({
+                'success': True,
+                'gender': gender,
+                'stories': stories,
+                'count': len(stories)
+            })
+    
+    except Exception as e:
+        app_logger.error(f"Error fetching stories by gender: {str(e)}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': f'Error fetching stories: {str(e)}'
+        }), 500
 
 @app.route('/')
 def index():

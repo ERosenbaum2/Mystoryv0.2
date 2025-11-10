@@ -1099,13 +1099,17 @@ def replace_face_in_image(story_image, user_image, character_name=None):
         mask = cv2.GaussianBlur(mask, (15, 15), 0)
         
         # Blend the faces
+        # Normalize mask to [0, 1] range
+        mask = mask / 255.0 if mask.max() > 1.0 else mask
+        
         blended_face = np.zeros_like(story_face_region, dtype=np.float32)
         for c in range(3):
+            # mask is 2D (story_h, story_w), so use it directly without np.newaxis
             blended_face[:, :, c] = (
-                story_face_region[:, :, c].astype(np.float32) * (1 - mask[:, :, np.newaxis]) +
-                user_face_resized[:, :, c].astype(np.float32) * mask[:, :, np.newaxis]
+                story_face_region[:, :, c].astype(np.float32) * (1 - mask) +
+                user_face_resized[:, :, c].astype(np.float32) * mask
             )
-        blended_face = blended_face.astype(np.uint8)
+        blended_face = np.clip(blended_face, 0, 255).astype(np.uint8)
         
         # Replace the face region in the story image
         result_array = story_array.copy()
@@ -5210,14 +5214,17 @@ def generate_storybook_background(task_id, filepath, gender, story_choice, chara
                                     character_name
                                 )
                                 text_data_list.append(text_data)
-                            except:
+                            except Exception as e:
+                                print(f"Warning: Error generating text for page {page_number}: {str(e)}")
                                 text_data_list.append({"narrative": []})
                         else:
                             text_data_list.append({"narrative": []})
                         print(f"✓ Processed page {page_number}/13")
                     else:
-                        print(f"✗ Failed to process page {page_number}/13")
-                        # Continue with other pages even if one fails
+                        error_msg = f"Failed to process page {page_number}/13"
+                        print(f"✗ {error_msg}")
+                        # Continue with other pages even if one fails, but log the error
+                        generation_progress[task_id]['error'] = f"{error_msg}. Some pages may be missing."
                         text_data_list.append({"narrative": []})
                 
                 # Generate PDF
@@ -5245,11 +5252,14 @@ def generate_storybook_background(task_id, filepath, gender, story_choice, chara
                 return
                 
             except Exception as e:
-                print(f"Error processing Little Red Riding Hood images: {str(e)}")
+                error_msg = f"Error processing Little Red Riding Hood images: {str(e)}"
+                print(error_msg)
                 import traceback
                 traceback.print_exc()
                 generation_progress[task_id]['status'] = 'error'
-                generation_progress[task_id]['error'] = f'Error processing images: {str(e)}'
+                generation_progress[task_id]['error'] = error_msg
+                generation_progress[task_id]['current_step'] = f'Error: {str(e)[:100]}'
+                app_logger.error(error_msg, exc_info=True)
                 return
         
         # For other stories (Jack and the Beanstalk), continue with DALL-E generation

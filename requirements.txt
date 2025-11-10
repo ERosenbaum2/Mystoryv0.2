@@ -17,3 +17,6 @@ psycopg2-binary==2.9.9
 Flask-Login==0.6.3
 Authlib==1.3.0
 better-profanity==0.7.0
+opencv-python==4.8.1.78
+dlib==19.24.2
+face-recognition==1.3.0

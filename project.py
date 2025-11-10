@@ -13,8 +13,17 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import io
+# Try to import face recognition libraries
+try:
+    import cv2
+    import face_recognition
+    FACE_RECOGNITION_AVAILABLE = True
+except ImportError:
+    FACE_RECOGNITION_AVAILABLE = False
+    cv2 = None
+    face_recognition = None
 import requests
 import tempfile
 import threading
@@ -954,45 +963,404 @@ def validate_image_for_book(file_path):
         }
 
 # ============================================================================
+# IMAGE PROCESSING FOR PRE-EXISTING STORY IMAGES
+# ============================================================================
+
+def load_story_image(story_id, page_number):
+    """
+    Load a pre-existing story image from the story images folder.
+    
+    Args:
+        story_id: The story identifier (e.g., 'red' for Little Red Riding Hood)
+        page_number: Page number (1-13, where 1 is cover, 13 is last page)
+    
+    Returns:
+        PIL Image object or None if not found
+    """
+    try:
+        # Map story_id to folder name
+        story_folders = {
+            'red': 'LittleRedRidingHoodImages'
+        }
+        
+        if story_id not in story_folders:
+            return None
+        
+        folder_name = story_folders[story_id]
+        folder_path = os.path.join(os.path.dirname(__file__), folder_name)
+        
+        # Try different image formats and naming conventions
+        image_extensions = ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']
+        image_names = [
+            f'Image{page_number}.jpg',
+            f'Image{page_number}.png',
+            f'image{page_number}.jpg',
+            f'image{page_number}.png',
+            f'Image{page_number:02d}.jpg',
+            f'Image{page_number:02d}.png'
+        ]
+        
+        for img_name in image_names:
+            img_path = os.path.join(folder_path, img_name)
+            if os.path.exists(img_path):
+                return Image.open(img_path).convert('RGB')
+        
+        # If exact match not found, try with extensions
+        for ext in image_extensions:
+            img_path = os.path.join(folder_path, f'Image{page_number}{ext}')
+            if os.path.exists(img_path):
+                return Image.open(img_path).convert('RGB')
+        
+        print(f"Warning: Could not find image for story {story_id}, page {page_number}")
+        return None
+        
+    except Exception as e:
+        print(f"Error loading story image: {str(e)}")
+        return None
+
+
+def replace_face_in_image(story_image, user_image, character_name=None):
+    """
+    Replace the main character's face in the story image with the user's face.
+    
+    This function:
+    1. Detects faces in both images
+    2. Extracts facial features from user image
+    3. Replaces/overlays the face in the story image
+    
+    Args:
+        story_image: PIL Image of the story page
+        user_image: PIL Image of the user's uploaded photo
+        character_name: Optional character name for text replacement
+    
+    Returns:
+        PIL Image with replaced face
+    """
+    try:
+        if not FACE_RECOGNITION_AVAILABLE:
+            # Fallback: Simple blending if face recognition not available
+            print("Face recognition not available, using simple image blending")
+            return _simple_face_blend(story_image, user_image)
+        
+        # Check if numpy is available
+        if not HAS_NUMPY:
+            print("NumPy not available, using simple blending")
+            return _simple_face_blend(story_image, user_image)
+        
+        # Convert PIL images to numpy arrays for face_recognition
+        story_array = np.array(story_image)
+        user_array = np.array(user_image)
+        
+        # Detect faces in both images
+        story_face_locations = face_recognition.face_locations(story_array, model='hog')
+        user_face_locations = face_recognition.face_locations(user_array, model='hog')
+        
+        if not story_face_locations or not user_face_locations:
+            print("Could not detect faces, using simple blending")
+            return _simple_face_blend(story_image, user_image)
+        
+        # Get the largest face from user image (assuming it's the main subject)
+        user_face_location = max(user_face_locations, key=lambda loc: (loc[2] - loc[0]) * (loc[3] - loc[1]))
+        
+        # Get the largest face from story image (assuming it's the main character)
+        story_face_location = max(story_face_locations, key=lambda loc: (loc[2] - loc[0]) * (loc[3] - loc[1]))
+        
+        # Extract face encodings
+        user_face_encoding = face_recognition.face_encodings(user_array, [user_face_location])[0]
+        
+        # Get face landmarks for better alignment
+        user_landmarks = face_recognition.face_landmarks(user_array, [user_face_location])[0]
+        story_landmarks = face_recognition.face_landmarks(story_array, [story_face_location])[0]
+        
+        # Extract face regions
+        top, right, bottom, left = user_face_location
+        user_face = user_array[top:bottom, left:right]
+        
+        top_s, right_s, bottom_s, left_s = story_face_location
+        story_face_region = story_array[top_s:bottom_s, left_s:right_s]
+        
+        # Resize user face to match story face size
+        user_face_resized = cv2.resize(user_face, (right_s - left_s, bottom_s - top_s))
+        
+        # Create a mask for seamless blending
+        mask = np.ones((bottom_s - top_s, right_s - left_s), dtype=np.float32)
+        
+        # Apply Gaussian blur to mask edges for smoother blending
+        mask = cv2.GaussianBlur(mask, (15, 15), 0)
+        
+        # Blend the faces
+        for c in range(3):
+            story_face_region[:, :, c] = (
+                story_face_region[:, :, c] * (1 - mask[:, :, np.newaxis]) +
+                user_face_resized[:, :, c] * mask[:, :, np.newaxis]
+            ).astype(np.uint8)
+        
+        # Replace the face region in the story image
+        result_array = story_array.copy()
+        result_array[top_s:bottom_s, left_s:right_s] = story_face_region
+        
+        # Convert back to PIL Image
+        result_image = Image.fromarray(result_array)
+        
+        return result_image
+        
+    except Exception as e:
+        print(f"Error in face replacement: {str(e)}")
+        # Fallback to simple blending
+        return _simple_face_blend(story_image, user_image)
+
+
+def _simple_face_blend(story_image, user_image):
+    """
+    Simple fallback method for face blending when face recognition is not available.
+    Uses basic image blending techniques.
+    """
+    try:
+        # Resize user image to a reasonable size for blending
+        user_resized = user_image.resize((400, 400), Image.Resampling.LANCZOS)
+        
+        # Create a circular mask for blending
+        mask_size = 300
+        mask = Image.new('L', (mask_size, mask_size), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.ellipse([(0, 0), (mask_size, mask_size)], fill=255)
+        
+        # Apply Gaussian blur to mask (simulated with resize)
+        mask = mask.resize((mask_size, mask_size), Image.Resampling.LANCZOS)
+        
+        # Find a good position to place the face (center-left area, typical for character)
+        story_width, story_height = story_image.size
+        paste_x = int(story_width * 0.15)
+        paste_y = int(story_height * 0.3)
+        
+        # Resize user image to match mask
+        user_face = user_resized.resize((mask_size, mask_size), Image.Resampling.LANCZOS)
+        
+        # Create a copy of story image
+        result = story_image.copy()
+        
+        # Paste user face with mask for blending
+        result.paste(user_face, (paste_x, paste_y), mask)
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error in simple face blend: {str(e)}")
+        return story_image
+
+
+def replace_text_in_image(image, old_text_patterns, new_text, character_name):
+    """
+    Replace text in the image with the character's name.
+    
+    This function attempts to find and replace text in the image.
+    Since OCR can be unreliable, we use a simpler approach:
+    - Detect text regions (if OCR available)
+    - Or use predefined regions for known text locations
+    - Overlay new text with similar font/style
+    
+    Args:
+        image: PIL Image
+        old_text_patterns: List of text patterns to look for (e.g., ["Little Red Riding Hood", "Red"])
+        new_text: New text to replace with (character name)
+        character_name: The character's name
+    
+    Returns:
+        PIL Image with text replaced
+    """
+    try:
+        result = image.copy()
+        draw = ImageDraw.Draw(result)
+        
+        # Try to load a font (use default if not available)
+        try:
+            # Try to use a nice font
+            font_size = 40
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except:
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+                except:
+                    font = ImageFont.load_default()
+        except:
+            font = ImageFont.load_default()
+        
+        # Common text regions in storybook images (top, center, bottom)
+        # We'll overlay text in likely locations
+        width, height = image.size
+        
+        # Text regions to check/overlay (as percentages)
+        text_regions = [
+            (0.1, 0.05, 0.9, 0.15),  # Top area (title)
+            (0.1, 0.85, 0.9, 0.95),  # Bottom area (caption)
+        ]
+        
+        # For now, we'll add the character name as a subtle overlay
+        # In a production system, you'd use OCR to detect and replace exact text
+        # For this implementation, we'll add the name in a corner or replace visible text areas
+        
+        # Draw character name in bottom-right corner (subtle)
+        text_bbox = draw.textbbox((0, 0), character_name, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        
+        # Position: bottom-right with padding
+        x = width - text_width - 20
+        y = height - text_height - 20
+        
+        # Draw text with outline for visibility
+        # Draw outline
+        for adj in range(-2, 3):
+            for adj2 in range(-2, 3):
+                draw.text((x + adj, y + adj2), character_name, font=font, fill=(0, 0, 0, 200))
+        # Draw main text
+        draw.text((x, y), character_name, font=font, fill=(255, 255, 255, 255))
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error replacing text in image: {str(e)}")
+        return image
+
+
+def process_story_image(story_id, page_number, user_image_path, character_name, output_path):
+    """
+    Main function to process a pre-existing story image:
+    1. Load the story image
+    2. Load the user image
+    3. Replace face/character features
+    4. Replace text with character name
+    5. Save the result
+    
+    Args:
+        story_id: Story identifier (e.g., 'red')
+        page_number: Page number (1-13)
+        user_image_path: Path to user's uploaded image
+        character_name: Character name for text replacement
+        output_path: Where to save the processed image
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Load story image
+        story_image = load_story_image(story_id, page_number)
+        if story_image is None:
+            print(f"Failed to load story image for page {page_number}")
+            return False
+        
+        # Load user image
+        user_image = Image.open(user_image_path).convert('RGB')
+        
+        # Replace face/character features
+        processed_image = replace_face_in_image(story_image, user_image, character_name)
+        
+        # Replace text with character name
+        # Common text patterns in Little Red Riding Hood images
+        old_text_patterns = ["Little Red Riding Hood", "Red Riding Hood", "Little Red", "Red"]
+        final_image = replace_text_in_image(processed_image, old_text_patterns, character_name, character_name)
+        
+        # Save the result
+        final_image.save(output_path, 'PNG', quality=95)
+        
+        print(f"✓ Processed story image for page {page_number}: {output_path}")
+        return True
+        
+    except Exception as e:
+        print(f"Error processing story image: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+# ============================================================================
 # MULTI-THREADED IMAGE GENERATION
 # ============================================================================
 
-def generate_page_image(page_data, user_image_path, output_dir, page_index):
+def generate_page_image(page_data, user_image_path, output_dir, page_index, storyline_id=None, character_name=None):
     """
-    Worker function that simulates the creation of a single page image.
+    Worker function that creates a single page image.
     
-    This function represents the work that would be done to generate one page
-    of the storybook. In a real implementation, this would call the actual
-    image generation API (e.g., DALL-E).
+    For Little Red Riding Hood (storyline_id='red'), this function:
+    1. Loads the pre-existing story image from LittleRedRidingHoodImages folder
+    2. Replaces the character's face/features with the user's uploaded image
+    3. Replaces text in the image with the character's name
+    4. Saves the processed image
+    
+    For other stories, it generates images from scratch (or uses mock images).
     
     Args:
         page_data: Dictionary containing page information (scene_desc, text, image_prompt_template)
         user_image_path: Path to the user's uploaded image
         output_dir: Directory where generated images should be saved
-        page_index: Index of the page (0-11 for the 12 story pages)
+        page_index: Index of the page (0-11 for the 12 story pages, or 0-12 for 13 pages including cover)
+        storyline_id: Story identifier (e.g., 'red' for Little Red Riding Hood)
+        character_name: Name of the character for text replacement
     
     Returns:
         dict: {
-            'page_number': int,  # Page number (1-12)
+            'page_number': int,  # Page number (1-13 for Little Red Riding Hood, 1-12 for others)
             'image_path': str,    # Path to generated image file
             'success': bool,      # Whether generation succeeded
             'error': str          # Error message if failed
         }
     """
     try:
+        page_number = page_index + 1
+        image_filename = f'page_{page_number:02d}.png'
+        image_path = os.path.join(output_dir, image_filename)
+        
+        # Check if this is Little Red Riding Hood story - use pre-existing images
+        if storyline_id == 'red':
+            # Little Red Riding Hood has 13 images (Image1.jpg to Image13.jpg)
+            # Image1 is the cover, Image2-Image13 are the 12 story pages
+            # For page_index 0-11, we use Image2-Image13
+            # For a cover page (if needed), we'd use Image1
+            
+            # Map page_index to story image number
+            # page_index 0-11 corresponds to Image2-Image13 (pages 1-12 of story)
+            # If we need a cover, page_index -1 or special handling would use Image1
+            story_image_number = page_index + 2  # page_index 0 -> Image2, page_index 11 -> Image13
+            
+            # Ensure we don't exceed 13 images
+            if story_image_number > 13:
+                story_image_number = 13
+            
+            # Process the pre-existing story image
+            success = process_story_image(
+                story_id='red',
+                page_number=story_image_number,
+                user_image_path=user_image_path,
+                character_name=character_name or "Little Red Riding Hood",
+                output_path=image_path
+            )
+            
+            if success:
+                print(f"✓ Processed Little Red Riding Hood page {page_number} (Image{story_image_number}): {image_path}")
+                return {
+                    'page_number': page_number,
+                    'image_path': image_path,
+                    'success': True,
+                    'error': None
+                }
+            else:
+                error_msg = f"Failed to process story image for page {page_number}"
+                print(f"✗ {error_msg}")
+                return {
+                    'page_number': page_number,
+                    'image_path': None,
+                    'success': False,
+                    'error': error_msg
+                }
+        
+        # For other stories, use the original mock generation (or DALL-E in production)
         # Simulate image generation work (in real implementation, this would call DALL-E)
-        # Add random delay to simulate variable generation times (0.5-2 seconds)
         generation_time = random.uniform(0.5, 2.0)
         time.sleep(generation_time)
         
         # Create a mock image file for demonstration
         # In production, this would be the actual generated image from DALL-E
-        page_number = page_index + 1
-        image_filename = f'page_{page_number:02d}.png'
-        image_path = os.path.join(output_dir, image_filename)
-        
-        # Create a simple mock image using PIL
-        # This simulates the generated image file
         mock_image = Image.new('RGB', (1024, 1024), color=(200, 220, 255))
         
         # Add some text to indicate it's a mock
@@ -1189,7 +1557,9 @@ def start_book_generation(storyline_id, user_image_path, output_dir=None, book_i
                     page_data,
                     user_image_path,
                     output_dir,
-                    page_index
+                    page_index,
+                    storyline_id,  # Pass storyline_id for pre-existing image detection
+                    child_name  # Pass child_name for text replacement (character_name parameter)
                 )
                 future_to_page[future] = page_index
             

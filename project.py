@@ -1262,22 +1262,37 @@ def process_story_image(story_id, page_number, user_image_path, character_name, 
         bool: True if successful, False otherwise
     """
     try:
+        # Yield control to eventlet periodically to prevent worker timeout
+        eventlet.sleep(0)
+        
         # Load story image
         story_image = load_story_image(story_id, page_number)
         if story_image is None:
             print(f"Failed to load story image for page {page_number}")
             return False
         
+        # Yield control
+        eventlet.sleep(0)
+        
         # Load user image
         user_image = Image.open(user_image_path).convert('RGB')
         
+        # Yield control
+        eventlet.sleep(0)
+        
         # Replace face/character features
         processed_image = replace_face_in_image(story_image, user_image, character_name)
+        
+        # Yield control
+        eventlet.sleep(0)
         
         # Replace text with character name
         # Common text patterns in Little Red Riding Hood images
         old_text_patterns = ["Little Red Riding Hood", "Red Riding Hood", "Little Red", "Red"]
         final_image = replace_text_in_image(processed_image, old_text_patterns, character_name, character_name)
+        
+        # Yield control
+        eventlet.sleep(0)
         
         # Save the result
         final_image.save(output_path, 'PNG', quality=95)
@@ -5185,6 +5200,9 @@ def generate_storybook_background(task_id, filepath, gender, story_choice, chara
                 
                 # Process all 13 images
                 for page_index in range(13):
+                    # Yield control to eventlet to prevent worker timeout
+                    eventlet.sleep(0)
+                    
                     page_number = page_index + 1
                     generation_progress[task_id]['progress'] = page_number
                     generation_progress[task_id]['current_step'] = f'Processing page {page_number}/13...'
@@ -5201,13 +5219,28 @@ def generate_storybook_background(task_id, filepath, gender, story_choice, chara
                         output_path=image_path
                     )
                     
+                    # Yield again after processing each image
+                    eventlet.sleep(0)
+                    
                     if success:
                         generated_images.append(image_path)
                         # Get text data for this page if available
                         if page_index < len(pages):
                             try:
+                                # Yield control before text generation
+                                eventlet.sleep(0)
+                                
+                                page_data = pages[page_index] if page_index < len(pages) else {}
+                                # Ensure page_data has required fields
+                                if not isinstance(page_data, dict):
+                                    page_data = {}
+                                if 'description' not in page_data:
+                                    page_data['description'] = f"Page {page_number} of Little Red Riding Hood"
+                                if 'prompt' not in page_data:
+                                    page_data['prompt'] = ""
+                                
                                 text_data = generate_page_text(
-                                    pages[page_index] if page_index < len(pages) else {},
+                                    page_data,
                                     'red',
                                     page_index + 1,
                                     13,
@@ -5216,6 +5249,8 @@ def generate_storybook_background(task_id, filepath, gender, story_choice, chara
                                 text_data_list.append(text_data)
                             except Exception as e:
                                 print(f"Warning: Error generating text for page {page_number}: {str(e)}")
+                                import traceback
+                                traceback.print_exc()
                                 text_data_list.append({"narrative": []})
                         else:
                             text_data_list.append({"narrative": []})
@@ -5229,6 +5264,9 @@ def generate_storybook_background(task_id, filepath, gender, story_choice, chara
                 
                 # Generate PDF
                 if generated_images:
+                    # Yield control before PDF creation
+                    eventlet.sleep(0)
+                    
                     generation_progress[task_id]['current_step'] = 'Creating PDF...'
                     pdf_path = os.path.join(tempfile.gettempdir(), f"storybook_{task_id}.pdf")
                     
@@ -5239,6 +5277,9 @@ def generate_storybook_background(task_id, filepath, gender, story_choice, chara
                         story_title,
                         character_name
                     )
+                    
+                    # Yield control after PDF creation
+                    eventlet.sleep(0)
                     
                     generation_progress[task_id]['status'] = 'completed'
                     generation_progress[task_id]['pdf_path'] = pdf_path

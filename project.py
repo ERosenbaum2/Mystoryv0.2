@@ -5147,17 +5147,116 @@ def generate_storybook_background(task_id, filepath, gender, story_choice, chara
             'error': None
         }
         
-        # Analyze child's appearance
-        child_appearance = analyze_child_appearance(filepath)
-        generation_progress[task_id]['progress'] = 1
-        generation_progress[task_id]['current_step'] = 'Child appearance analyzed'
-        
         # Determine story base
         story_titles = {
             'jack': 'Jack and the Beanstalk',
             'red': 'Little Red Riding Hood'
         }
         story_title = story_titles.get(story_choice, 'Custom Story')
+        
+        # SPECIAL HANDLING FOR LITTLE RED RIDING HOOD: Use pre-existing images
+        if story_choice == 'red':
+            print(f"\n{'='*60}")
+            print(f"LITTLE RED RIDING HOOD: Using pre-existing images from folder")
+            print(f"Character: {character_name}")
+            print(f"{'='*60}\n")
+            
+            # Use the start_book_generation function which handles pre-existing images
+            try:
+                # Create a temporary output directory
+                output_dir = os.path.join(tempfile.gettempdir(), f"storybook_{task_id}")
+                os.makedirs(output_dir, exist_ok=True)
+                
+                # Process all 13 images (Image1.jpg to Image13.jpg)
+                generated_images = []
+                text_data_list = []
+                
+                # Get page data from storyline for text
+                with app.app_context():
+                    storyline = Storyline.query.filter_by(story_id='red').first()
+                    if storyline:
+                        pages = storyline.get_pages()
+                    else:
+                        pages = []
+                
+                # Process all 13 images
+                for page_index in range(13):
+                    page_number = page_index + 1
+                    generation_progress[task_id]['progress'] = page_number
+                    generation_progress[task_id]['current_step'] = f'Processing page {page_number}/13...'
+                    
+                    # Process the story image
+                    image_filename = f'page_{page_number:02d}.png'
+                    image_path = os.path.join(output_dir, image_filename)
+                    
+                    success = process_story_image(
+                        story_id='red',
+                        page_number=page_number,
+                        user_image_path=filepath,
+                        character_name=character_name or "Little Red Riding Hood",
+                        output_path=image_path
+                    )
+                    
+                    if success:
+                        generated_images.append(image_path)
+                        # Get text data for this page if available
+                        if page_index < len(pages):
+                            try:
+                                text_data = generate_page_text(
+                                    pages[page_index] if page_index < len(pages) else {},
+                                    'red',
+                                    page_index + 1,
+                                    13,
+                                    character_name
+                                )
+                                text_data_list.append(text_data)
+                            except:
+                                text_data_list.append({"narrative": []})
+                        else:
+                            text_data_list.append({"narrative": []})
+                        print(f"✓ Processed page {page_number}/13")
+                    else:
+                        print(f"✗ Failed to process page {page_number}/13")
+                        # Continue with other pages even if one fails
+                        text_data_list.append({"narrative": []})
+                
+                # Generate PDF
+                if generated_images:
+                    generation_progress[task_id]['current_step'] = 'Creating PDF...'
+                    pdf_path = os.path.join(tempfile.gettempdir(), f"storybook_{task_id}.pdf")
+                    
+                    create_storybook_pdf(
+                        generated_images,
+                        text_data_list,
+                        pdf_path,
+                        story_title,
+                        character_name
+                    )
+                    
+                    generation_progress[task_id]['status'] = 'completed'
+                    generation_progress[task_id]['pdf_path'] = pdf_path
+                    generation_progress[task_id]['progress'] = 13
+                    generation_progress[task_id]['current_step'] = 'Storybook completed!'
+                    print(f"✓ Storybook PDF created: {pdf_path}")
+                else:
+                    generation_progress[task_id]['status'] = 'error'
+                    generation_progress[task_id]['error'] = 'Failed to process any images'
+                
+                return
+                
+            except Exception as e:
+                print(f"Error processing Little Red Riding Hood images: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                generation_progress[task_id]['status'] = 'error'
+                generation_progress[task_id]['error'] = f'Error processing images: {str(e)}'
+                return
+        
+        # For other stories (Jack and the Beanstalk), continue with DALL-E generation
+        # Analyze child's appearance
+        child_appearance = analyze_child_appearance(filepath)
+        generation_progress[task_id]['progress'] = 1
+        generation_progress[task_id]['current_step'] = 'Child appearance analyzed'
         
         # Get all prompts - ensure we get the FULL storybook (13 images total)
         all_prompts = get_all_prompts_for_story(story_choice, gender)

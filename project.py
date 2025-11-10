@@ -15,15 +15,13 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from PIL import Image, ImageDraw, ImageFont
 import io
-# Try to import face recognition libraries
+# Try to import OpenCV for face detection
 try:
     import cv2
-    import face_recognition
-    FACE_RECOGNITION_AVAILABLE = True
+    OPENCV_AVAILABLE = True
 except ImportError:
-    FACE_RECOGNITION_AVAILABLE = False
+    OPENCV_AVAILABLE = False
     cv2 = None
-    face_recognition = None
 import requests
 import tempfile
 import threading
@@ -1024,7 +1022,7 @@ def replace_face_in_image(story_image, user_image, character_name=None):
     Replace the main character's face in the story image with the user's face.
     
     This function:
-    1. Detects faces in both images
+    1. Detects faces in both images using OpenCV's face detection
     2. Extracts facial features from user image
     3. Replaces/overlays the face in the story image
     
@@ -1037,67 +1035,81 @@ def replace_face_in_image(story_image, user_image, character_name=None):
         PIL Image with replaced face
     """
     try:
-        if not FACE_RECOGNITION_AVAILABLE:
-            # Fallback: Simple blending if face recognition not available
-            print("Face recognition not available, using simple image blending")
+        if not OPENCV_AVAILABLE or not HAS_NUMPY:
+            # Fallback: Simple blending if OpenCV or NumPy not available
+            print("OpenCV or NumPy not available, using simple image blending")
             return _simple_face_blend(story_image, user_image)
         
-        # Check if numpy is available
-        if not HAS_NUMPY:
-            print("NumPy not available, using simple blending")
-            return _simple_face_blend(story_image, user_image)
-        
-        # Convert PIL images to numpy arrays for face_recognition
+        # Convert PIL images to numpy arrays for OpenCV
         story_array = np.array(story_image)
         user_array = np.array(user_image)
         
-        # Detect faces in both images
-        story_face_locations = face_recognition.face_locations(story_array, model='hog')
-        user_face_locations = face_recognition.face_locations(user_array, model='hog')
+        # Convert RGB to BGR for OpenCV (OpenCV uses BGR format)
+        story_bgr = cv2.cvtColor(story_array, cv2.COLOR_RGB2BGR)
+        user_bgr = cv2.cvtColor(user_array, cv2.COLOR_RGB2BGR)
         
-        if not story_face_locations or not user_face_locations:
+        # Convert to grayscale for face detection
+        story_gray = cv2.cvtColor(story_bgr, cv2.COLOR_BGR2GRAY)
+        user_gray = cv2.cvtColor(user_bgr, cv2.COLOR_BGR2GRAY)
+        
+        # Load OpenCV's face detection cascade
+        # Try to use DNN-based face detector (more accurate) or fallback to Haar cascade
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        
+        # Detect faces in both images
+        story_faces = face_cascade.detectMultiScale(
+            story_gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30)
+        )
+        user_faces = face_cascade.detectMultiScale(
+            user_gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30)
+        )
+        
+        if len(story_faces) == 0 or len(user_faces) == 0:
             print("Could not detect faces, using simple blending")
             return _simple_face_blend(story_image, user_image)
         
         # Get the largest face from user image (assuming it's the main subject)
-        user_face_location = max(user_face_locations, key=lambda loc: (loc[2] - loc[0]) * (loc[3] - loc[1]))
+        user_face = max(user_faces, key=lambda rect: rect[2] * rect[3])
+        user_x, user_y, user_w, user_h = user_face
         
         # Get the largest face from story image (assuming it's the main character)
-        story_face_location = max(story_face_locations, key=lambda loc: (loc[2] - loc[0]) * (loc[3] - loc[1]))
+        story_face = max(story_faces, key=lambda rect: rect[2] * rect[3])
+        story_x, story_y, story_w, story_h = story_face
         
-        # Extract face encodings
-        user_face_encoding = face_recognition.face_encodings(user_array, [user_face_location])[0]
-        
-        # Get face landmarks for better alignment
-        user_landmarks = face_recognition.face_landmarks(user_array, [user_face_location])[0]
-        story_landmarks = face_recognition.face_landmarks(story_array, [story_face_location])[0]
-        
-        # Extract face regions
-        top, right, bottom, left = user_face_location
-        user_face = user_array[top:bottom, left:right]
-        
-        top_s, right_s, bottom_s, left_s = story_face_location
-        story_face_region = story_array[top_s:bottom_s, left_s:right_s]
+        # Extract face regions (convert back to RGB for PIL)
+        user_face_region = user_array[user_y:user_y+user_h, user_x:user_x+user_w]
+        story_face_region = story_array[story_y:story_y+story_h, story_x:story_x+story_w]
         
         # Resize user face to match story face size
-        user_face_resized = cv2.resize(user_face, (right_s - left_s, bottom_s - top_s))
+        user_face_resized = cv2.resize(user_face_region, (story_w, story_h))
         
-        # Create a mask for seamless blending
-        mask = np.ones((bottom_s - top_s, right_s - left_s), dtype=np.float32)
+        # Create a mask for seamless blending (elliptical mask)
+        mask = np.zeros((story_h, story_w), dtype=np.float32)
+        center = (story_w // 2, story_h // 2)
+        axes = (story_w // 2 - 10, story_h // 2 - 10)
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
         
         # Apply Gaussian blur to mask edges for smoother blending
         mask = cv2.GaussianBlur(mask, (15, 15), 0)
         
         # Blend the faces
+        blended_face = np.zeros_like(story_face_region, dtype=np.float32)
         for c in range(3):
-            story_face_region[:, :, c] = (
-                story_face_region[:, :, c] * (1 - mask[:, :, np.newaxis]) +
-                user_face_resized[:, :, c] * mask[:, :, np.newaxis]
-            ).astype(np.uint8)
+            blended_face[:, :, c] = (
+                story_face_region[:, :, c].astype(np.float32) * (1 - mask[:, :, np.newaxis]) +
+                user_face_resized[:, :, c].astype(np.float32) * mask[:, :, np.newaxis]
+            )
+        blended_face = blended_face.astype(np.uint8)
         
         # Replace the face region in the story image
         result_array = story_array.copy()
-        result_array[top_s:bottom_s, left_s:right_s] = story_face_region
+        result_array[story_y:story_y+story_h, story_x:story_x+story_w] = blended_face
         
         # Convert back to PIL Image
         result_image = Image.fromarray(result_array)
@@ -1106,6 +1118,8 @@ def replace_face_in_image(story_image, user_image, character_name=None):
         
     except Exception as e:
         print(f"Error in face replacement: {str(e)}")
+        import traceback
+        traceback.print_exc()
         # Fallback to simple blending
         return _simple_face_blend(story_image, user_image)
 

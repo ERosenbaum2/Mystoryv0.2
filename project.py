@@ -2852,7 +2852,9 @@ def register():
         <body>
             <div class="container">
                 <h1>Create Account</h1>
-                <form method="POST">
+                <form id="registerForm" method="POST">
+                    <div id="errorMessage" class="error" style="display: none;"></div>
+                    <div id="successMessage" class="success" style="display: none;"></div>
                     <div class="form-group">
                         <label for="name">Name</label>
                         <input type="text" id="name" name="name" required>
@@ -2872,6 +2874,47 @@ def register():
                     </div>
                 </form>
             </div>
+            <script>
+                document.getElementById('registerForm').addEventListener('submit', async function(e) {
+                    e.preventDefault();
+                    const formData = new FormData(this);
+                    const errorDiv = document.getElementById('errorMessage');
+                    const successDiv = document.getElementById('successMessage');
+                    const submitBtn = this.querySelector('button[type="submit"]');
+                    
+                    errorDiv.style.display = 'none';
+                    successDiv.style.display = 'none';
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = 'Registering...';
+                    
+                    try {
+                        const response = await fetch('/register', {
+                            method: 'POST',
+                            body: formData
+                        });
+                        
+                        const data = await response.json();
+                        
+                        if (data.success) {
+                            successDiv.textContent = 'Registration successful! Redirecting...';
+                            successDiv.style.display = 'block';
+                            setTimeout(() => {
+                                window.location.href = '/';
+                            }, 1500);
+                        } else {
+                            errorDiv.textContent = data.error || 'Registration failed';
+                            errorDiv.style.display = 'block';
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = 'Register';
+                        }
+                    } catch (error) {
+                        errorDiv.textContent = 'An error occurred. Please try again.';
+                        errorDiv.style.display = 'block';
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = 'Register';
+                    }
+                });
+            </script>
         </body>
         </html>
         '''
@@ -3067,7 +3110,9 @@ def login():
                     <span>OR</span>
                 </div>
                 ''' if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET else '') + '''
-                <form method="POST">
+                <form id="loginForm" method="POST">
+                    <div id="errorMessage" class="error" style="display: none;"></div>
+                    <div id="successMessage" class="success" style="display: none;"></div>
                     <div class="form-group">
                         <label for="email">Email</label>
                         <input type="email" id="email" name="email" required>
@@ -3082,6 +3127,47 @@ def login():
                     </div>
                 </form>
             </div>
+            <script>
+                document.getElementById('loginForm').addEventListener('submit', async function(e) {
+                    e.preventDefault();
+                    const formData = new FormData(this);
+                    const errorDiv = document.getElementById('errorMessage');
+                    const successDiv = document.getElementById('successMessage');
+                    const submitBtn = this.querySelector('button[type="submit"]');
+                    
+                    errorDiv.style.display = 'none';
+                    successDiv.style.display = 'none';
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = 'Logging in...';
+                    
+                    try {
+                        const response = await fetch('/login', {
+                            method: 'POST',
+                            body: formData
+                        });
+                        
+                        const data = await response.json();
+                        
+                        if (data.success) {
+                            successDiv.textContent = 'Login successful! Redirecting...';
+                            successDiv.style.display = 'block';
+                            setTimeout(() => {
+                                window.location.href = '/';
+                            }, 1500);
+                        } else {
+                            errorDiv.textContent = data.error || 'Login failed';
+                            errorDiv.style.display = 'block';
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = 'Login';
+                        }
+                    } catch (error) {
+                        errorDiv.textContent = 'An error occurred. Please try again.';
+                        errorDiv.style.display = 'block';
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = 'Login';
+                    }
+                });
+            </script>
         </body>
         </html>
         '''
@@ -3145,10 +3231,23 @@ def login():
 def logout():
     """User logout route."""
     try:
+        user_id = current_user.user_id if current_user.is_authenticated else None
         logout_user()
+        
+        # Log successful logout
+        if user_id:
+            app_logger.info(
+                f"User logout successful (user_id: {user_id})",
+                extra={'user_id': user_id}
+            )
+        
+        # If it's a GET request (like from a link), redirect to home
+        if request.method == 'GET':
+            return redirect(url_for('index'))
+        
         return jsonify({'success': True, 'message': 'Logged out successfully'}), 200
     except Exception as e:
-        print(f"Logout error: {str(e)}")
+        app_logger.error(f"Logout error: {str(e)}", exc_info=True)
         return jsonify({'success': False, 'error': 'Logout failed'}), 500
 
 # ============================================================================
